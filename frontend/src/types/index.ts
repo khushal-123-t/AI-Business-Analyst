@@ -26,7 +26,10 @@ export interface AskResponse {
 
 export interface DashboardMetrics {
   total_revenue: number;
-  total_profit: number;
+  total_profit: number | null;
+  profit_available?: boolean;
+  profit_source?: string | null;
+  profit_note?: string | null;
   total_orders: number;
   total_customers: number;
   average_order_value: number;
@@ -38,6 +41,7 @@ export interface DashboardResponse {
   revenue_by_category: Record<string, any>[];
   revenue_by_region: Record<string, any>[];
   profit_by_category: Record<string, any>[];
+  profit_available?: boolean;
   top_customers: Record<string, any>[];
   monthly_orders: Record<string, any>[];
 }
@@ -65,3 +69,84 @@ export interface HistoryItem {
   sql: string;
   chart_type: string;
 }
+
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  role: 'ADMIN' | 'CLIENT';
+  client_id?: number | null;
+  is_active: boolean;
+  created_at: string;
+  last_login?: string | null;
+}
+
+export interface Client {
+  id: number;
+  company_name: string;
+  contact_name: string;
+  email: string;
+  phone?: string | null;
+  industry?: string | null;
+  plan?: string | null;
+  status: 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
+  created_at: string;
+  last_login?: string | null;
+}
+
+export interface Dataset {
+  id: number;
+  client_id: number;
+  name: string;
+  filename: string;
+  table_name: string;
+  row_count: number;
+  col_count: number;
+  status: string;
+  created_at: string;
+}
+
+export interface Report {
+  id: number;
+  client_id: number;
+  dataset_id: number;
+  name: string;
+  report_type: string;
+  status: string;
+  created_at: string;
+  content?: string | null;
+}
+
+export interface AdminDashboardMetrics {
+  total_clients: number;
+  active_clients: number;
+  inactive_clients: number;
+  suspended_clients: number;
+  total_datasets: number;
+  total_analyses: number;
+  reports_generated: number;
+  active_users: number;
+}
+
+export interface AdminDashboardResponse {
+  metrics: AdminDashboardMetrics;
+  client_growth: Record<string, any>[];
+  client_usage: Record<string, any>[];
+  recent_activity: Record<string, any>[];
+}
+
+export interface ClientProfileResponse {
+  user: User;
+  client?: Client | null;
+}
+
+export interface LibraryDataset {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  rows: number;
+  columns: number;
+  filename: string;
+}
+

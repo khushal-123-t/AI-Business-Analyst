@@ -79,9 +79,13 @@ export default function Dashboard() {
         />
         <KPICard
           title="Total Profit"
-          value={formatCurrency(metrics.total_profit)}
+          value={metrics.total_profit !== null ? formatCurrency(metrics.total_profit) : "Not available"}
           icon={TrendingUp}
-          description={`Profit Margin: ${Math.round((metrics.total_profit / metrics.total_revenue) * 100)}%`}
+          description={
+            metrics.total_profit !== null && metrics.total_revenue > 0
+              ? (metrics.profit_note || `Profit Margin: ${Math.round((metrics.total_profit / metrics.total_revenue) * 100)}%`)
+              : "Cannot be calculated from available data"
+          }
           color="emerald"
         />
         <KPICard
@@ -141,7 +145,7 @@ export default function Dashboard() {
       </div>
 
       {/* Category Breakdowns Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <div className={`grid grid-cols-1 ${data.profit_by_category && data.profit_by_category.length > 0 ? "lg:grid-cols-3" : "lg:grid-cols-2"} gap-8`}>
         {/* Revenue by Category (Pie/Donut) */}
         <div className="glass-panel p-6 rounded-xl border border-slate-800/80">
           <div className="mb-4">
@@ -157,20 +161,22 @@ export default function Dashboard() {
           />
         </div>
 
-        {/* Profit by Category (Bar) */}
-        <div className="glass-panel p-6 rounded-xl border border-slate-800/80">
-          <div className="mb-4">
-            <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Profit by Category</h3>
-            <span className="text-[10px] text-slate-500 font-medium">Absolute margins per category</span>
+        {/* Profit by Category (Bar) - Only render if profit data exists */}
+        {data.profit_by_category && data.profit_by_category.length > 0 && (
+          <div className="glass-panel p-6 rounded-xl border border-slate-800/80">
+            <div className="mb-4">
+              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Profit by Category</h3>
+              <span className="text-[10px] text-slate-500 font-medium">Absolute margins per category</span>
+            </div>
+            <ChartsWrapper
+              chartType="bar"
+              xAxis="category"
+              yAxis="profit"
+              data={data.profit_by_category}
+              height={260}
+            />
           </div>
-          <ChartsWrapper
-            chartType="bar"
-            xAxis="category"
-            yAxis="profit"
-            data={data.profit_by_category}
-            height={260}
-          />
-        </div>
+        )}
 
         {/* Revenue by Region (Bar) */}
         <div className="glass-panel p-6 rounded-xl border border-slate-800/80">
@@ -191,7 +197,7 @@ export default function Dashboard() {
       {/* Top 10 Customers DataTable */}
       <div className="grid grid-cols-1 gap-8">
         <DataTable
-          columns={['customer_name', 'revenue', 'profit']}
+          columns={metrics.total_profit !== null ? ['customer_name', 'revenue', 'profit'] : ['customer_name', 'revenue']}
           rows={data.top_customers}
           title="Top 10 Customers by Revenue"
           pageSize={5}

@@ -31,18 +31,19 @@ export default function ChartsWrapper({ chartType, xAxis, yAxis, data, height = 
   }
 
   // Label formatting helper for tooltips
-  const formatValue = (value: any, name: string) => {
-    const key = name.toLowerCase();
+  const formatValue = (value: any, name?: any) => {
+    const actualName = name ? String(name) : '';
+    const key = actualName.toLowerCase();
     if (typeof value === 'number') {
       if (key.includes('revenue') || key.includes('profit') || key.includes('price') || key.includes('value') || key.includes('rev') || key.includes('aov')) {
-        return [`₹${value.toLocaleString('en-IN')}`, name.replace(/_/g, ' ')];
+        return [`₹${value.toLocaleString('en-IN')}`, actualName.replace(/_/g, ' ')];
       }
       if (key.includes('discount')) {
-        return [`${Math.round(value * 100)}%`, name.replace(/_/g, ' ')];
+        return [`${Math.round(value * 100)}%`, actualName.replace(/_/g, ' ')];
       }
-      return [value.toLocaleString(), name.replace(/_/g, ' ')];
+      return [value.toLocaleString(), actualName.replace(/_/g, ' ')];
     }
-    return [value, name];
+    return [value, actualName];
   };
 
   // Y-axis tick formatting helper

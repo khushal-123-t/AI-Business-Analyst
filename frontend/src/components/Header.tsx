@@ -1,28 +1,36 @@
 import React, { useEffect, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { Database, ShieldCheck, RefreshCw } from 'lucide-react';
 import { api } from '../services/api';
 
-interface HeaderProps {
-  activeTab: string;
-}
-
-export default function Header({ activeTab }: HeaderProps) {
+export default function Header() {
   const [dbConnected, setDbConnected] = useState<boolean>(true);
   const [checking, setChecking] = useState<boolean>(false);
+  
+  const location = useLocation();
 
   const getTitle = () => {
-    switch (activeTab) {
-      case 'dashboard':
-        return 'Executive Sales Dashboard';
-      case 'analyst':
-        return 'AI Analytics Assistant';
-      case 'explorer':
-        return 'Database Schema Explorer';
-      case 'history':
-        return 'Analytical Query Logs';
-      default:
-        return 'Business intelligence';
+    const path = location.pathname;
+    if (path.startsWith('/admin/dashboard')) {
+      return 'Platform Control Panel';
+    } else if (path.startsWith('/admin/clients')) {
+      return 'Client Management Hub';
+    } else if (path.startsWith('/admin/analytics')) {
+      return 'Platform Resource Usage';
+    } else if (path.startsWith('/client/dashboard')) {
+      return 'Corporate Dashboard';
+    } else if (path.startsWith('/client/data')) {
+      return 'Relational Datasets Workspace';
+    } else if (path.startsWith('/client/analytics')) {
+      return 'Executive Business Analytics';
+    } else if (path.startsWith('/client/insights')) {
+      return 'AI Business Analyst Assistant';
+    } else if (path.startsWith('/client/reports')) {
+      return 'Saved Business Reports';
+    } else if (path.startsWith('/client/profile')) {
+      return 'Account Configuration';
     }
+    return 'InsightGen Intelligence';
   };
 
   const checkHealth = async () => {
@@ -45,37 +53,37 @@ export default function Header({ activeTab }: HeaderProps) {
   }, []);
 
   return (
-    <header className="h-20 border-b border-slate-800 bg-[#0d121f]/80 backdrop-blur-md px-8 flex items-center justify-between sticky top-0 z-40">
+    <header className="h-20 border-b border-slate-800 bg-[#0d121f]/80 backdrop-blur-md px-8 flex items-center justify-between sticky top-0 z-40 shrink-0">
       <div>
-        <h2 className="text-xl font-bold text-slate-100 tracking-tight">{getTitle()}</h2>
-        <p className="text-xs text-slate-400 font-medium">Real-time business insights from SQLite warehouse</p>
+        <h2 className="text-sm font-bold text-slate-100 uppercase tracking-wider">{getTitle()}</h2>
+        <p className="text-[10px] text-slate-450 font-semibold tracking-wide">Real-time business insights from SQLite warehouse</p>
       </div>
 
       <div className="flex items-center gap-4">
-        {/* Database Connection Badge */}
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/60 border border-slate-700/60">
-          <Database className={`h-4 w-4 ${dbConnected ? 'text-emerald-400' : 'text-rose-400'}`} />
-          <span className="text-xs font-semibold text-slate-300">business.db</span>
-          <div className="relative flex h-2 w-2">
-            <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${dbConnected ? 'bg-emerald-400' : 'bg-rose-400'}`}></span>
-            <span className={`relative inline-flex rounded-full h-2 w-2 ${dbConnected ? 'bg-emerald-400' : 'bg-rose-400'}`}></span>
+        {/* Database Connection Status Badge */}
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900/60 border border-slate-805 text-slate-400">
+          <Database className={`h-3.5 w-3.5 ${dbConnected ? 'text-emerald-450' : 'text-rose-450'}`} />
+          <span className="text-[10px] font-bold uppercase tracking-wider">business.db</span>
+          <div className="relative flex h-1.5 w-1.5">
+            <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${dbConnected ? 'bg-emerald-450' : 'bg-rose-450'}`}></span>
+            <span className={`relative inline-flex rounded-full h-1.5 w-1.5 ${dbConnected ? 'bg-emerald-450' : 'bg-rose-450'}`}></span>
           </div>
         </div>
 
         {/* Read-Only Safety Badge */}
         <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
-          <ShieldCheck className="h-4 w-4" />
-          <span className="text-xs font-medium uppercase tracking-wider text-[10px]">Read-Only Mode</span>
+          <ShieldCheck className="h-3.5 w-3.5" />
+          <span className="text-[9px] font-bold uppercase tracking-wider">Read-Only SQL Sandbox</span>
         </div>
 
-        {/* Refresh connection status */}
+        {/* Refresh button */}
         <button
           onClick={checkHealth}
           disabled={checking}
           className="p-2 text-slate-400 hover:text-slate-200 rounded-lg hover:bg-slate-800 transition"
-          title="Refresh connection status"
+          title="Refresh database connection status"
         >
-          <RefreshCw className={`h-4 w-4 ${checking ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`h-3.5 w-3.5 ${checking ? 'animate-spin' : ''}`} />
         </button>
       </div>
     </header>

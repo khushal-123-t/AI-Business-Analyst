@@ -6,7 +6,7 @@ interface SQLViewerProps {
 }
 
 export default function SQLViewer({ sql }: SQLViewerProps) {
-  const [expanded, setExpanded] = useState<boolean>(false);
+  const [expanded, setExpanded] = useState<boolean>(true);
   const [copied, setCopied] = useState<boolean>(false);
 
   const handleCopy = async () => {
