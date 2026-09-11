@@ -21,8 +21,8 @@ database/
 
 # Environments
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Node / Frontend
 node_modules/
