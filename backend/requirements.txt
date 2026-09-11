@@ -4,6 +4,7 @@ uvicorn[standard]>=0.28.0
 
 # Database & ORM
 sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
 
 # Data analysis & spreadsheet handling
 pandas>=2.2.0

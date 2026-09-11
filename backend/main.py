@@ -59,10 +59,27 @@ create_and_seed_tables()
 # Initialize FastAPI App
 app = FastAPI(title="AI Business Analyst API", version="1.0.0")
 
-# Enable CORS for frontend development
+# Enable CORS for frontend deployment (Vercel, Render, and local development)
+cors_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+# Dynamically parse FRONTEND_URL from environment
+if hasattr(settings, "FRONTEND_URL") and settings.FRONTEND_URL:
+    for origin_candidate in settings.FRONTEND_URL.split(","):
+        clean_origin = origin_candidate.strip().rstrip("/")
+        if clean_origin and clean_origin not in cors_origins:
+            cors_origins.append(clean_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=cors_origins,
+    allow_origin_regex=r"^https://.*\.vercel\.app$|^https://.*\.onrender\.com$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,8 +87,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    """Validates Gemini configuration and system dependencies on startup."""
+    """Validates Gemini configuration, database status, and system dependencies on startup."""
     logger.info("Starting AI Business Analyst API (Gemini LLM Provider)...")
+    try:
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+        logger.info(f"[Database] Engine ready. Active tables: {len(tables)} tables ({', '.join(tables[:5])}...)")
+        print(f"[Database] Engine ready with {len(tables)} active tables.")
+    except Exception as db_err:
+        logger.error(f"[Database] Startup inspection failed: {db_err}")
+        print(f"[Database] WARNING: Startup inspection failed: {db_err}")
+
     if settings.GEMINI_API_KEY:
         logger.info(f"[Gemini] Configured with model '{settings.GEMINI_MODEL}'.")
         print(f"[Gemini] Active LLM Provider: Gemini ({settings.GEMINI_MODEL}).")
@@ -107,14 +133,16 @@ def health_check():
         inspector = inspect(engine)
         tables = inspector.get_table_names()
         llm_status = provider_manager.get_status()
+        db_type = "sqlite" if str(engine.url).startswith("sqlite") else "postgresql"
         return {
             "status": "connected",
-            "database": "business.db",
+            "database": db_type,
             "tables_count": len(tables),
             "llm": llm_status,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
 
 # --- AUTHENTICATION ENDPOINTS ---

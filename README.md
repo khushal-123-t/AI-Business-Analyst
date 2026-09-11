@@ -123,12 +123,20 @@ The backend is pre-configured for deployment as a Web Service on Render:
 - **Build Command**: `pip install -r requirements.txt` (or `pip install -r backend/requirements.txt`)
 - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Python Version**: Pinned to `3.12.10` via `.python-version`
-- **Environment Variables to Set in Render**:
-  - `LLM_PROVIDER`: `gemini`
-  - `GEMINI_API_KEY`: `<your_gemini_api_key>`
-  - `GEMINI_MODEL`: `gemini-3.6-flash`
-  - `JWT_SECRET`: `<your_jwt_secret>`
-  - `DATABASE_URL`: `sqlite:///database/business.db`
+
+### Environment Variables to Set in Render:
+| Variable | Value | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | Sole AI provider |
+| `GEMINI_API_KEY` | `<your_gemini_api_key>` | Google Gemini API key |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Supported fast multimodal model |
+| `JWT_SECRET` | `<your_secure_random_string>` | Secret key for signing auth tokens |
+| `DATABASE_URL` | `sqlite:///database/business.db` | Auto-creates SQLite dir/db at boot |
+| `FRONTEND_URL` | `https://your-app.vercel.app` | Allowed CORS origin for Vercel/production |
+
+> [!WARNING]
+> **Render Ephemeral Storage Warning**: Render's free Web Service filesystem is **ephemeral**. Any SQLite database file (`database/business.db`) created on disk will be reset or lost upon container restart or redeployment.
+> For production data persistence, provision a managed PostgreSQL database in Render and set `DATABASE_URL=postgresql://user:password@host/dbname`. The backend automatically detects and connects to PostgreSQL without any code changes.
 
 ---
 
