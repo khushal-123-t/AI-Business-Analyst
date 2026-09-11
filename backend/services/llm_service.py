@@ -201,6 +201,8 @@ def validate_referenced_columns(sql: str, available_columns: list) -> tuple[bool
 
     return True, ""
 
+from backend.services.schema_service import is_identifier_column, classify_column_role, FinancialRole
+
 def generate_sql(
     question: str, 
     session_id: str = "default_session", 
@@ -214,6 +216,7 @@ def generate_sql(
     """
     Translates a natural language question into dialect-aware safe SQL (PostgreSQL or SQLite).
     Strictly data-driven: uses actual schema and sample rows without assuming sales columns.
+    Enforces that identifier columns (e.g. payment_id) are never SUM-ed or AVG-ed, and are instead COUNT-ed.
     Uses Gemini as sole AI provider.
     """
     dialect = get_db_dialect()
@@ -226,12 +229,35 @@ def generate_sql(
         schema_lines = [
             f"TARGET DATABASE DIALECT: {dialect.upper()}",
             f"TARGET TABLE: {quoted_table_name}",
-            "AVAILABLE COLUMNS & DATA TYPES:"
+            "AVAILABLE COLUMNS, ROLES & DATA TYPES:"
         ]
+        
+        col_names = [c["name"] if isinstance(c, dict) else str(c) for c in columns]
+        id_cols = [c for c in col_names if is_identifier_column(c)]
+        measure_cols = [c for c in col_names if not is_identifier_column(c)]
+
         for col in columns:
             col_n = col["name"] if isinstance(col, dict) else str(col)
             col_t = col.get("type", "VARCHAR") if isinstance(col, dict) else "VARCHAR"
-            schema_lines.append(f"  - {col_n} ({col_t})")
+            role = classify_column_role(col_n, col_t)
+            if role == FinancialRole.IDENTIFIER:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: IDENTIFIER / UNIQUE KEY — COUNT only, NEVER SUM or AVG]")
+            elif role in [FinancialRole.UNIT_PRICE, FinancialRole.SELLING_PRICE]:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Unit price. Price alone without quantity is NOT revenue; yields Average Price]")
+            elif role == FinancialRole.QUANTITY:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: QUANTITY — Units/Volume. Quantity alone without price is NOT revenue; yields Total Quantity]")
+            elif role in [FinancialRole.GROSS_REVENUE, FinancialRole.NET_REVENUE]:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Authoritative revenue/sales column]")
+            elif role == FinancialRole.DISCOUNT_AMOUNT:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: DISCOUNT_AMOUNT — Deducted monetary discount]")
+            elif role == FinancialRole.DISCOUNT_PERCENT:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: DISCOUNT_PERCENT — Percentage discount to deduct]")
+            elif role in [FinancialRole.REFUND, FinancialRole.RETURN]:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Refund/return to deduct from revenue]")
+            elif role in [FinancialRole.TAX_AMOUNT, FinancialRole.TAX_PERCENT, FinancialRole.SHIPPING_FEE, FinancialRole.OTHER_FEE, FinancialRole.COGS, FinancialRole.COST_PRICE]:
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Separate financial metric; do NOT automatically add to revenue]")
+            else:
+                schema_lines.append(f"  - {col_n} ({col_t})")
         
         # Include sample rows if available
         if sample_rows and len(sample_rows) > 0:
@@ -243,16 +269,14 @@ def generate_sql(
         schema_text = "\n".join(schema_lines)
         target_table_info = f"Target Table: You MUST execute queries exclusively on the table {quoted_table_name}. Do NOT query 'sales' or any other table."
         
-        col_names = [c["name"] if isinstance(c, dict) else str(c) for c in columns]
-        col_names_lower = [c.lower() for c in col_names]
         date_col = next((c for c in col_names if "date" in c.lower() or "time" in c.lower() or "created" in c.lower() or "year" in c.lower()), None)
         
         hints = []
         # Dynamic Hints without assuming sales
         # Profit column identification
-        profit_col = next((c for c in col_names if c.lower() in ["profit", "net_profit", "gross_profit", "profit_amount", "total_profit", "earnings"]), None)
-        margin_col = next((c for c in col_names if c.lower() in ["profit_margin", "profit_margin_percent", "margin_percent", "margin_percentage", "margin"]), None)
-        rev_col = next((c for c in col_names if any(k in c.lower() for k in ["revenue", "sales", "total_amount", "salary", "spend", "visits", "amount", "price"])), col_names[0] if col_names else "amount")
+        profit_col = next((c for c in measure_cols if c.lower() in ["profit", "net_profit", "gross_profit", "profit_amount", "total_profit", "earnings"]), None)
+        margin_col = next((c for c in measure_cols if c.lower() in ["profit_margin", "profit_margin_percent", "margin_percent", "margin_percentage", "margin"]), None)
+        rev_col = next((c for c in measure_cols if any(k in c.lower() for k in ["payment_amount", "revenue", "sales", "total_amount", "salary", "spend", "visits", "amount", "price"])), measure_cols[0] if measure_cols else "amount")
 
         if profit_col:
             hints.append(f"- ACTUAL PROFIT DATA: The table contains a real profit column `{profit_col}`. Use this column directly for any profit queries. Never apply any assumed margin.")
@@ -263,6 +287,10 @@ def generate_sql(
         else:
             hints.append("- NO PROFIT DATA: This table has NO profit column and NO margin column, and the user did NOT specify a margin. You must NEVER calculate, estimate, or invent profit. DO NOT assume 18% or any other default margin.")
         
+        if id_cols:
+            id_list_str = ", ".join(f"`{c}`" for c in id_cols)
+            hints.append(f"- IDENTIFIER COLUMNS ({id_list_str}): These columns are identifiers/keys, NOT numeric measures. NEVER calculate SUM() or AVG() on them. When the user asks for total/number of payments/transactions/orders, use COUNT(`{id_cols[0]}`) or COUNT(DISTINCT `{id_cols[0]}`). For monetary totals, use an actual numeric amount column.")
+
         extra_hints = "\n".join(hints)
     else:
         dialect_upper = dialect.upper()
@@ -270,7 +298,7 @@ def generate_sql(
         schema_text = format_schema()
         target_table_info = f"Target Table: Only use the tables and columns defined in the schema below ({quoted_table_name})."
         date_col = "order_date"
-        extra_hints = "- If the table contains an actual profit column, use it. Never assume 18% or any default profit margin."
+        extra_hints = "- If the table contains an actual profit column, use it. Never assume 18% or any default profit margin.\n- Never SUM() or AVG() an identifier column (such as payment_id or order_id)."
 
     context_text = get_history_context(session_id)
 
@@ -332,6 +360,28 @@ Rules for SQL generation:
    - Profit calculation must be strictly data-driven, never assumption-driven.
    - NEVER invent, assume, infer, or calculate a default profit margin (e.g. NEVER assume 18%, 20%, or any arbitrary percentage).
    - Only generate SQL involving profit when real profit/margin columns exist or the user explicitly specified a margin.
+6. STRICT IDENTIFIER & METRIC AGGREGATION RULES:
+   - Columns representing IDs/identifiers (such as payment_id, Payment ID, paymentid, transaction_id, order_id, customer_id, invoice_id, etc.) are keys, NOT numeric measures.
+   - You must NEVER calculate SUM() or AVG() on identifier columns. SUM(payment_id) is strictly forbidden.
+   - For payment/transaction counts (e.g. 'total payments', 'number of payments', 'total transactions', 'how many orders'):
+     * Use COUNT(payment_id) or COUNT(DISTINCT payment_id).
+     * If duplicate Payment IDs are possible, use COUNT(DISTINCT payment_id).
+   - For monetary amounts (e.g. 'total payment amount', 'total revenue', 'total amount', 'average payment amount'):
+     * Use the actual monetary column (such as payment_amount, amount, revenue), NEVER payment_id.
+7. STRICT INTELLIGENT REVENUE CALCULATION RULES:
+   - Do NOT assume Revenue = Price × Quantity in every case. Inspect the actual dataset schema and roles.
+   - REVENUE CALCULATION PRECEDENCE:
+     1) Explicit Total / Net Revenue: If an authoritative revenue column exists (e.g. net_revenue, revenue, total_revenue, total_amount, line_total), use SUM(column) directly as revenue. Do NOT recalculate as price * quantity.
+     2) Gross Sales with Deductions: If gross sales exists along with discount or refund columns: calculate Revenue = SUM(gross_sales - COALESCE(discount, 0) - COALESCE(refund, 0)).
+     3) Price and Quantity: If both unit price and quantity exist:
+        * Base revenue = SUM(price * quantity)
+        * If discount amount exists: SUM((price * quantity) - COALESCE(discount, 0))
+        * If discount percentage exists: SUM((price * quantity) * (1.0 - (COALESCE(discount, 0) / 100.0)))
+        * If refunds exist: subtract COALESCE(refund, 0)
+     4) Payment Amount: If payment_amount exists, use SUM(payment_amount).
+   - PRICE WITHOUT QUANTITY: If the dataset has unit_price / price but NO quantity column, price alone is NOT revenue. Treat it as unit price (e.g. calculate AVG(price) for average price, or COUNT(*) for item count). NEVER calculate SUM(price) as total revenue.
+   - QUANTITY WITHOUT PRICE: If the dataset has quantity but NO price column, calculate SUM(quantity) as total units/volume, NOT revenue.
+   - TAX, SHIPPING, FEES, COSTS: Keep taxes, shipping fees, processing fees, and COGS/cost separate. NEVER automatically add taxes or shipping to revenue unless the user explicitly requests gross receipts including taxes/shipping.
 {extra_hints}
 
 {schema_text}
@@ -367,6 +417,22 @@ Previous context:
             quoted_t = quote_ident(table_name)
             sql = re.sub(r"\bFROM\s+sales\b", f"FROM {quoted_t}", sql, flags=re.IGNORECASE)
             sql = re.sub(r"\bJOIN\s+sales\b", f"JOIN {quoted_t}", sql, flags=re.IGNORECASE)
+
+        # Validate that identifier columns are NEVER summed or averaged
+        sum_avg_match = re.search(r"\b(SUM|AVG)\s*\(\s*(?:DISTINCT\s+)?[\"`]?([a-zA-Z0-9_]+)[\"`]?\s*\)", sql, re.IGNORECASE)
+        if sum_avg_match:
+            agg_func = sum_avg_match.group(1).upper()
+            agg_col = sum_avg_match.group(2)
+            if is_identifier_column(agg_col):
+                if retries < max_retries:
+                    feedback = f"Column '{agg_col}' is an identifier, not a numeric measure. It must NEVER be aggregated with {agg_func}(). For counts of {agg_col}, use COUNT({agg_col}) or COUNT(DISTINCT {agg_col}). For monetary totals, use an actual numeric/amount column (e.g. payment_amount)."
+                    logger.warning(f"[generate_sql] Disallowed {agg_func}({agg_col}) on identifier column. Retrying.")
+                    retries += 1
+                    continue
+                else:
+                    # Final safety fallback: convert SUM/AVG on identifier to COUNT
+                    logger.warning(f"[generate_sql] Converting disallowed {agg_func}({agg_col}) to COUNT({agg_col})")
+                    sql = re.sub(rf"\b{agg_func}\s*\(\s*(DISTINCT\s+)?([\"`]?{re.escape(agg_col)}[\"`]?)\s*\)", r"COUNT(\1\2)", sql, flags=re.IGNORECASE)
 
         # Validate the generated SQL for safety
         is_safe, err_msg = is_safe_sql(sql)

@@ -177,35 +177,6 @@ export default function Login() {
             </a>
           </p>
         </div>
-
-        <div className="pt-2 text-center space-y-2.5">
-          <p className="text-[11px] text-slate-400 font-medium">Quick Demo Sign-In:</p>
-          <div className="flex gap-2 justify-center">
-            <button
-              type="button"
-              onClick={() => {
-                setEmail('client1@example.com');
-                setPassword('client123');
-              }}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 transition-all cursor-pointer"
-            >
-              Fill Client (client1)
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setEmail('admin@example.com');
-                setPassword('admin123');
-              }}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-500/15 hover:bg-purple-500/25 border border-purple-500/30 text-purple-300 transition-all cursor-pointer"
-            >
-              Fill Admin (admin)
-            </button>
-          </div>
-          <div className="text-[10px] text-slate-500">
-            Client: <span className="font-semibold text-slate-400">client1@example.com / client123</span> | Admin: <span className="font-semibold text-slate-400">admin@example.com / admin123</span>
-          </div>
-        </div>
       </div>
     </div>
   );

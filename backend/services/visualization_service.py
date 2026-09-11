@@ -17,6 +17,8 @@ def is_date_string(val) -> bool:
         return True
     return False
 
+from backend.services.schema_service import is_identifier_column
+
 def determine_chart_config(columns: list, rows: list) -> dict:
     """
     Analyzes the query result set to select the optimal chart type and axes.
@@ -51,8 +53,8 @@ def determine_chart_config(columns: list, rows: list) -> dict:
         if is_date_string(val):
             date_cols.append(col)
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
-            # Exclude obvious IDs from numeric variables if possible
-            if "id" in col.lower() or col.lower() == "index":
+            # Exclude identifiers from numeric metrics for charting
+            if is_identifier_column(col):
                 text_cols.append(col)
             else:
                 numeric_cols.append(col)

@@ -32,10 +32,18 @@ class AskResponse(BaseModel):
 
 class DashboardMetrics(BaseModel):
     total_revenue: float
-    total_profit: Optional[float] = None
+    gross_sales: Optional[float] = None
+    total_discounts: Optional[float] = None
+    total_tax: Optional[float] = None
+    total_shipping: Optional[float] = None
+    total_quantity: Optional[float] = None
+    total_cost: Optional[float] = None
+    average_price: Optional[float] = None
     total_orders: int
     total_customers: int
     average_order_value: float
+    total_profit: Optional[float] = None
+    profit_margin: Optional[float] = None
     profit_available: bool = True
     profit_source: Optional[str] = None
     profit_note: Optional[str] = None

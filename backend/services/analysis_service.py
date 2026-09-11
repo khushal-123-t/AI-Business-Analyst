@@ -1,11 +1,97 @@
+import re
 import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import text, inspect
 from backend.database.connection import quote_ident
+from backend.services.schema_service import inspect_dataset_schema, is_identifier_column, FinancialRole
+
+def format_identifier_count_title(col_name: str) -> str:
+    """
+    Dynamically formats identifier column names into natural pluralized dashboard count labels.
+    e.g.:
+      payment_id / Payment ID / paymentid -> "Total Payments"
+      order_id / Order ID / orderid -> "Total Orders"
+      transaction_id / trans_id -> "Total Transactions"
+      invoice_id / invoice_no -> "Total Invoices"
+      customer_id / cust_id -> "Total Customers"
+      client_id -> "Total Clients"
+      user_id -> "Total Users"
+      employee_id -> "Total Employees"
+    Never produces "Total Payment ID" or "Payment Id".
+    """
+    if not col_name:
+        return "Total Records"
+
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', str(col_name).strip()).lower()
+    norm = re.sub(r'[^a-z0-9]+', '_', s).strip('_')
+    tokens = norm.split('_')
+
+    PLURAL_MAP = {
+        "payment": "Payments",
+        "order": "Orders",
+        "transaction": "Transactions",
+        "trans": "Transactions",
+        "invoice": "Invoices",
+        "customer": "Customers",
+        "cust": "Customers",
+        "client": "Clients",
+        "user": "Users",
+        "employee": "Employees",
+        "emp": "Employees",
+        "member": "Members",
+        "account": "Accounts",
+        "product": "Products",
+        "item": "Items",
+        "visitor": "Visitors",
+        "visit": "Visits",
+        "ticket": "Tickets",
+        "receipt": "Receipts",
+        "lead": "Leads",
+        "deal": "Deals",
+        "contract": "Contracts",
+        "session": "Sessions",
+        "record": "Records",
+        "shipment": "Shipments",
+        "delivery": "Deliveries",
+        "subscription": "Subscriptions",
+        "sale": "Sales"
+    }
+
+    entity = None
+    if len(tokens) >= 2 and tokens[-1] in ("id", "ids", "no", "number", "num", "code", "key"):
+        entity = tokens[0]
+    elif norm.endswith("id") and len(norm) > 2:
+        base = norm[:-2].rstrip('_')
+        if base:
+            entity = base
+    elif tokens[0] in ("id", "code") and len(tokens) >= 2:
+        entity = tokens[1]
+
+    if entity and entity in PLURAL_MAP:
+        return f"Total {PLURAL_MAP[entity]}"
+
+    if entity:
+        if entity.endswith("y") and not entity.endswith(("ay", "ey", "oy", "uy")):
+            plural = entity[:-1] + "ies"
+        elif entity.endswith(("s", "x", "z", "ch", "sh")):
+            plural = entity + "es"
+        else:
+            plural = entity + "s"
+        return f"Total {plural.title()}"
+
+    clean_label = col_name.replace("_", " ").title()
+    if clean_label.lower().endswith(" id"):
+        base_word = clean_label[:-3].strip()
+        if base_word.lower() in PLURAL_MAP:
+            return f"Total {PLURAL_MAP[base_word.lower()]}"
+        return f"Total {base_word}s"
+
+    return f"Total {clean_label}"
 
 def analyze_result_set(columns: list, rows: list) -> dict:
     """
     Performs basic statistics and checks on a dynamic query result set using Pandas.
+    Rule 3: Excludes identifier columns (e.g. payment_id, order_id) from SUM and MEAN calculations.
     """
     if not rows:
         return {"row_count": 0, "numeric_summaries": {}}
@@ -17,9 +103,12 @@ def analyze_result_set(columns: list, rows: list) -> dict:
         "numeric_summaries": {}
     }
 
-    # Find numeric columns and calculate basic sums/means
+    # Find numeric columns and calculate basic sums/means (excluding identifiers)
     for col in columns:
         if col in df.columns:
+            # Rule 3: Identifier columns must NEVER be summed or averaged
+            if is_identifier_column(col):
+                continue
             try:
                 numeric_col = pd.to_numeric(df[col], errors='coerce')
                 if not pd.api.types.is_bool_dtype(numeric_col) and not numeric_col.isna().all():
@@ -47,8 +136,6 @@ def clean_category_name(val) -> str:
         s = s.split(",")[0].strip()
     s = s.strip('[]"\'').strip()
     return s if s else "General"
-
-from backend.services.schema_service import inspect_dataset_schema
 
 def clean_numeric_sql(col_expr: str, dialect: str = "sqlite") -> str:
     """
@@ -96,41 +183,88 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
                     return col
         return default
 
-    # 1. Resolve Revenue / Primary Metric Column
-    rev_col = find_best_match([
-        "total_revenue", "totalrevenue", "revenue", "sales", "ordervalue", "net_revenue",
-        "gross_revenue", "total_sales", "sales_amount", "total_amount", "final_amount",
-        "total_price", "selling_price", "final_price", "net_amount", "amount",
-        "salary", "spending_score", "spend", "visits", "website_visits", "price"
-    ])
-    
-    qty_col = find_best_match([
-        "quantity_sold", "quantity", "qty", "units_sold", "units", "items_count", "item_count"
-    ], default=None)
-    
-    unit_price_col = find_best_match([
-        "discounted_price", "retail_price", "unit_price", "unitprice", "price", "mrp", "value"
-    ], default=None)
-    
-    # Explicit recognized profit and margin keywords
-    PROFIT_KEYS = [
-        "profit", "net_profit", "gross_profit", "profit_amount", 
-        "total_profit", "earnings", "net_earnings", "operating_profit"
-    ]
-    
-    MARGIN_KEYS = [
-        "profit_margin", "profit_margin_percent", "profit_margin_percentage",
-        "margin_percent", "margin_percentage", "margin_pct", "net_margin",
-        "gross_margin", "operating_margin", "margin"
-    ]
+    # Resolve columns using financial roles and schema profiling
+    authoritative_rev = schema.get("authoritative_revenue_col")
+    gross_sales_col = schema.get("gross_sales_col")
+    price_col = schema.get("price_col")
+    selling_price_col = schema.get("selling_price_col")
+    unit_price_col = schema.get("unit_price_col")
+    qty_col = schema.get("quantity_col")
+    discount_col = schema.get("discount_col")
+    discount_type = schema.get("discount_type")
+    tax_col = schema.get("tax_col")
+    tax_type = schema.get("tax_type")
+    shipping_col = schema.get("shipping_col")
+    refund_col = schema.get("refund_col")
+    cost_col = schema.get("cost_col")
+    payment_amount_col = schema.get("payment_amount_col")
 
-    profit_col = schema.get("profit_col") or find_best_match(PROFIT_KEYS)
-    margin_col = schema.get("margin_col") or find_best_match(MARGIN_KEYS)
+    # Keyword fallbacks if profiler didn't identify candidates
+    if not authoritative_rev:
+        authoritative_rev = find_best_match([
+            "net_revenue", "net_sales", "total_revenue", "totalrevenue", "sales_amount",
+            "total_amount", "final_amount", "order_total", "invoice_total", "grand_total",
+            "revenue", "sales", "ordervalue", "net_amount", "amount", "line_total", "extended_price"
+        ])
+        if authoritative_rev and is_identifier_column(authoritative_rev):
+            authoritative_rev = None
+
+    if not gross_sales_col:
+        gross_sales_col = find_best_match([
+            "gross_sales", "sales_value", "gross_revenue", "total_sales", "subtotal", "gross_amount"
+        ])
+        if gross_sales_col and is_identifier_column(gross_sales_col):
+            gross_sales_col = None
+
+    if not price_col:
+        price_col = find_best_match([
+            "selling_price", "sale_price", "discounted_price", "retail_price",
+            "unit_price", "price", "unitprice", "mrp", "cost_per_unit", "item_price", "product_price"
+        ])
+        if price_col and is_identifier_column(price_col):
+            price_col = None
+
+    if not qty_col:
+        qty_col = find_best_match([
+            "quantity_sold", "quantity", "qty", "units_sold", "units", "items_count", "item_count", "pieces", "volume"
+        ])
+        if qty_col and is_identifier_column(qty_col):
+            qty_col = None
+
+    if not discount_col:
+        discount_col = find_best_match([
+            "discount_amount", "discount_value", "discount_percent", "discount_percentage", "discount_rate", "promo_discount", "coupon_discount", "discount"
+        ])
+        if discount_col:
+            discount_type = "PERCENT" if any(p in discount_col.lower() for p in ("percent", "percentage", "rate", "pct")) else "AMOUNT"
+
+    if not tax_col:
+        tax_col = find_best_match([
+            "tax_amount", "tax_value", "tax_rate", "tax_percent", "gst_amount", "gst_rate", "vat_amount", "vat_rate", "tax", "gst", "vat"
+        ])
+        if tax_col:
+            tax_type = "PERCENT" if any(p in tax_col.lower() for p in ("rate", "percent", "percentage", "pct")) else "AMOUNT"
+
+    if not shipping_col:
+        shipping_col = find_best_match([
+            "shipping_fee", "shipping_cost", "delivery_fee", "delivery_charge", "shipping"
+        ])
+
+    if not refund_col:
+        refund_col = find_best_match([
+            "refund_amount", "refund_value", "return_amount", "chargeback", "refund", "returns"
+        ])
+
+    if not cost_col:
+        cost_col = find_best_match([
+            "cost_of_goods_sold", "cogs", "total_cost", "cost_price", "purchase_price", "unit_cost", "cost", "expenses", "expense"
+        ])
 
     # Summary aggregated metrics (e.g. from dataset statistics / summary tables)
     summary_orders_col = find_best_match([
-        "total_transactions", "total_orders", "transactions_count", "orders_count",
-        "total_transaction", "total_order", "transactions", "orders"
+        "total_payments", "payments_count", "total_transactions", "total_orders",
+        "transactions_count", "orders_count", "total_transaction", "total_order",
+        "transactions", "orders", "payments"
     ], default=None)
 
     summary_cust_col = find_best_match([
@@ -142,7 +276,12 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
         "average_order_value", "avg_order_value", "avg_order", "aov"
     ], default=None)
 
+    payment_col = find_best_match([
+        "payment_id", "payment id", "paymentid", "payment_no", "payment_number"
+    ], default=None)
+
     order_col = find_best_match([
+        "payment_id", "payment id", "paymentid", "payment_no", "payment_number",
         "order_id", "order_no", "order_number", "id", "uniq_id", "pid",
         "show_id", "product_id", "item_id", "invoice_id", "invoice",
         "transaction_id", "transaction", "employee_id", "code"
@@ -173,9 +312,6 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
         "created_at", "time", "date_time", "datetime", "date_range", "year"
     ], default=None)
 
-    # Fallback to schema profiling dimensions if keyword matching didn't yield matches
-    if not rev_col and schema.get("primary_metric"):
-        rev_col = schema["primary_metric"]
     if not cat_col and schema.get("primary_category"):
         cat_col = schema["primary_category"]
     if not reg_col and schema.get("secondary_category"):
@@ -187,121 +323,311 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
     if not cust_name_col and schema.get("primary_name"):
         cust_name_col = schema["primary_name"]
 
+    # -------------------------------------------------------------
+    # REVENUE CALCULATION HIERARCHY (11)
+    # -------------------------------------------------------------
+    roles = schema.get("financial_roles", {})
+    has_real_revenue = False
+    revenue_expr = "1"
+    gross_sales_expr = None
+    revenue_source = "none"
+    metric_name = "Records Count"
+
+    # Hierarchy A: Authoritative Explicit Revenue Column (e.g. net_revenue, total_amount, sales)
+    if authoritative_rev and authoritative_rev in columns and not is_identifier_column(authoritative_rev):
+        has_real_revenue = True
+        is_already_net = any(k in authoritative_rev.lower() for k in ("net", "total_revenue", "totalrevenue", "final", "settled", "grand_total"))
+        if not is_already_net and (refund_col or discount_col):
+            gross_sales_expr = safe_col_expr(authoritative_rev)
+            parts = [gross_sales_expr]
+            if discount_col and discount_col in columns:
+                if discount_type == "PERCENT":
+                    parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
+                else:
+                    parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
+            if refund_col and refund_col in columns:
+                parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
+            revenue_expr = f"({' '.join(parts)})"
+            revenue_source = "revenue_minus_deductions"
+            metric_name = "Net Revenue"
+        else:
+            revenue_expr = safe_col_expr(authoritative_rev)
+            gross_sales_expr = safe_col_expr(gross_sales_col) if (gross_sales_col and gross_sales_col in columns) else revenue_expr
+            revenue_source = "authoritative_revenue"
+            metric_name = authoritative_rev.replace("_", " ").title()
+
+    # Hierarchy B: Explicit Gross Sales Column with optional discounts / refunds
+    elif gross_sales_col and gross_sales_col in columns and not is_identifier_column(gross_sales_col):
+        has_real_revenue = True
+        gross_sales_expr = safe_col_expr(gross_sales_col)
+        parts = [gross_sales_expr]
+        if discount_col and discount_col in columns:
+            if discount_type == "PERCENT":
+                parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
+            else:
+                parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
+        if refund_col and refund_col in columns:
+            parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
+        revenue_expr = f"({' '.join(parts)})"
+        revenue_source = "gross_sales_with_deductions"
+        metric_name = "Net Revenue"
+
+    # Hierarchy C: Selling Price × Quantity with optional discounts / refunds
+    elif price_col and qty_col and price_col in columns and qty_col in columns and not is_identifier_column(price_col) and not is_identifier_column(qty_col):
+        has_real_revenue = True
+        gross_sales_expr = f"({safe_col_expr(price_col)} * {safe_col_expr(qty_col)})"
+        parts = [gross_sales_expr]
+        if discount_col and discount_col in columns:
+            if discount_type == "PERCENT":
+                parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
+            else:
+                parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
+        if refund_col and refund_col in columns:
+            parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
+        revenue_expr = f"({' '.join(parts)})"
+        revenue_source = "price_times_quantity"
+        metric_name = "Net Sales" if (discount_col or refund_col) else "Revenue"
+
+    # Hierarchy D: Payment Amount (in payment datasets)
+    elif payment_amount_col and payment_amount_col in columns and not is_identifier_column(payment_amount_col):
+        has_real_revenue = True
+        revenue_expr = safe_col_expr(payment_amount_col)
+        gross_sales_expr = revenue_expr
+        revenue_source = "payment_amount"
+        metric_name = payment_amount_col.replace("_", " ").title()
+
+    # Hierarchy E: Selling Price in product/transaction datasets (e.g. discounted_price / selling_price without a quantity column)
+    elif selling_price_col and selling_price_col in columns and not is_identifier_column(selling_price_col) and not qty_col and (order_col or cust_name_col or schema.get("id_columns")):
+        has_real_revenue = True
+        revenue_expr = safe_col_expr(selling_price_col)
+        gross_sales_expr = safe_col_expr(unit_price_col) if (unit_price_col and unit_price_col in columns) else revenue_expr
+        revenue_source = "selling_price"
+        metric_name = selling_price_col.replace("_", " ").title()
+
+    # Hierarchy F: Unit Price only (without quantity) -> NOT revenue; Average Price
+    elif price_col and price_col in columns and not is_identifier_column(price_col):
+        has_real_revenue = False
+        revenue_expr = "1"
+        gross_sales_expr = None
+        revenue_source = "price_only"
+        metric_name = "Average Price"
+
+    # Hierarchy F: Quantity only (without price) -> NOT revenue; Total Quantity
+    elif qty_col and qty_col in columns and not is_identifier_column(qty_col):
+        has_real_revenue = False
+        revenue_expr = "1"
+        gross_sales_expr = None
+        revenue_source = "quantity_only"
+        metric_name = "Total Quantity"
+
+    # Hierarchy G: Other valid primary numeric metric
+    elif schema.get("primary_metric") and schema["primary_metric"] in columns and not is_identifier_column(schema["primary_metric"]):
+        has_real_revenue = True
+        revenue_expr = safe_col_expr(schema["primary_metric"])
+        gross_sales_expr = revenue_expr
+        revenue_source = "primary_metric"
+        metric_name = schema["primary_metric"].replace("_", " ").title()
+
+    # -------------------------------------------------------------
+    # SEPARATE FINANCIAL METRIC AGGREGATES
+    # -------------------------------------------------------------
+    # Discounts (Never add to revenue; keep separate)
+    discounts_aggregate = None
+    if discount_col and discount_col in columns:
+        if discount_type == "PERCENT":
+            base = gross_sales_expr if gross_sales_expr else revenue_expr
+            discounts_aggregate = f"SUM({base} * ({safe_col_expr(discount_col)} / 100.0))"
+        else:
+            discounts_aggregate = f"SUM({safe_col_expr(discount_col)})"
+
+    # Tax (Never add to revenue; keep separate)
+    tax_aggregate = None
+    if tax_col and tax_col in columns:
+        if tax_type == "PERCENT":
+            base = gross_sales_expr if gross_sales_expr else revenue_expr
+            tax_aggregate = f"SUM({base} * ({safe_col_expr(tax_col)} / 100.0))"
+        else:
+            tax_aggregate = f"SUM({safe_col_expr(tax_col)})"
+
+    # Shipping / Delivery Fees (Never add to revenue; keep separate)
+    shipping_aggregate = None
+    if shipping_col and shipping_col in columns:
+        shipping_aggregate = f"SUM({safe_col_expr(shipping_col)})"
+
+    # Quantity Aggregate
+    quantity_aggregate = None
+    if qty_col and qty_col in columns:
+        quantity_aggregate = f"SUM({safe_col_expr(qty_col)})"
+
+    # Average Price Aggregate
+    avg_price_aggregate = None
+    if price_col and price_col in columns:
+        avg_price_aggregate = f"AVG({safe_col_expr(price_col)})"
+
+    # Cost / COGS
+    cost_aggregate = None
+    if cost_col and cost_col in columns:
+        cost_role = roles.get(cost_col)
+        if (cost_role == FinancialRole.COST_PRICE or "unit" in cost_col.lower()) and qty_col and qty_col in columns:
+            cost_calc_expr = f"({safe_col_expr(cost_col)} * {safe_col_expr(qty_col)})"
+        else:
+            cost_calc_expr = safe_col_expr(cost_col)
+        cost_aggregate = f"SUM({cost_calc_expr})"
+
+    # -------------------------------------------------------------
+    # PROFIT & MARGIN LOGIC
+    # -------------------------------------------------------------
+    profit_col = schema.get("profit_col")
+    margin_col = schema.get("margin_col")
+    profit_available = False
+    profit_source = None
+    profit_note = None
+    profit_expr = None
+
+    if profit_col and profit_col in columns:
+        profit_expr = safe_col_expr(profit_col)
+        profit_available = True
+        profit_source = "column"
+        profit_note = None
+    elif cost_col and cost_col in columns and has_real_revenue:
+        cost_role = roles.get(cost_col)
+        if (cost_role == FinancialRole.COST_PRICE or "unit" in cost_col.lower()) and qty_col and qty_col in columns:
+            cost_calc_expr = f"({safe_col_expr(cost_col)} * {safe_col_expr(qty_col)})"
+        else:
+            cost_calc_expr = safe_col_expr(cost_col)
+        profit_expr = f"({revenue_expr} - {cost_calc_expr})"
+        profit_available = True
+        profit_source = "revenue_minus_cogs"
+        profit_note = f"Calculated as Revenue minus COGS/Cost '{cost_col}'"
+    elif margin_col and margin_col in columns and has_real_revenue:
+        margin_clean = safe_col_expr(margin_col)
+        margin_mult = f"(CASE WHEN {margin_clean} > 1.0 THEN ({margin_clean} / 100.0) ELSE {margin_clean} END)"
+        profit_expr = f"({revenue_expr} * {margin_mult})"
+        profit_available = True
+        profit_source = "margin_column"
+        profit_note = f"Calculated using dataset margin column '{margin_col}'"
+    elif user_margin is not None and has_real_revenue:
+        margin_mult = user_margin / 100.0 if user_margin > 1.0 else user_margin
+        profit_expr = f"({revenue_expr} * {margin_mult})"
+        profit_available = True
+        profit_source = "user_margin"
+        profit_note = f"Estimated using user-provided {user_margin}% profit margin"
+    else:
+        profit_expr = None
+        profit_available = False
+        profit_source = None
+        profit_note = "Profit data unavailable"
+
+    # -------------------------------------------------------------
+    # ORDERS / TRANSACTIONS / PAYMENTS AGGREGATES
+    # -------------------------------------------------------------
+    if summary_orders_col and summary_orders_col in columns:
+        orders_aggregate = f"SUM({safe_col_expr(summary_orders_col)})"
+        order_id_field = "1"
+        count_name = format_identifier_count_title(summary_orders_col)
+    elif payment_col and payment_col in columns:
+        order_id_field = quote_ident(payment_col)
+        orders_aggregate = f"COUNT(DISTINCT {order_id_field})"
+        count_name = "Total Payments"
+    elif order_col and order_col in columns:
+        order_id_field = quote_ident(order_col)
+        orders_aggregate = f"COUNT(DISTINCT {order_id_field})"
+        count_name = format_identifier_count_title(order_col)
+    else:
+        order_id_field = "1"
+        orders_aggregate = "COUNT(*)"
+        count_name = "Total Records"
+
+    # Customers Aggregate
+    if summary_cust_col and summary_cust_col in columns:
+        customers_aggregate = f"SUM({safe_col_expr(summary_cust_col)})"
+        customer_id_field = "1"
+    elif cust_id_col and cust_id_col in columns:
+        customer_id_field = quote_ident(cust_id_col)
+        customers_aggregate = f"COUNT(DISTINCT {customer_id_field})"
+    else:
+        customer_id_field = order_id_field
+        customers_aggregate = orders_aggregate
+
+    # Customer / Item Name
+    if cust_name_col and cust_name_col in columns:
+        customer_name_field = quote_ident(cust_name_col)
+        item_label = cust_name_col.replace("_", " ").title()
+    elif order_col and order_col in columns:
+        customer_name_field = quote_ident(order_col)
+        item_label = order_col.replace("_", " ").title()
+    else:
+        customer_name_field = "'Item'"
+        item_label = "Item"
+
+    # Category
+    if cat_col and cat_col in columns:
+        category_field = quote_ident(cat_col)
+        category_name = cat_col.replace("_", " ").title()
+    else:
+        category_field = "'General'"
+        category_name = "Category"
+
+    # Region
+    if reg_col and reg_col in columns:
+        region_field = quote_ident(reg_col)
+        region_name = reg_col.replace("_", " ").title()
+    else:
+        region_field = "'Global'"
+        region_name = "Region"
+
+    # Date
+    order_date_field = quote_ident(date_col) if date_col and date_col in columns else None
+
     final_mapping = {
         "dialect": dialect,
-        "has_real_revenue": bool(rev_col and rev_col in columns),
+        "has_real_revenue": has_real_revenue,
+        "revenue": revenue_expr,
+        "gross_sales": gross_sales_expr,
+        "revenue_source": revenue_source,
+        "metric_name": metric_name,
         "has_real_category": bool(cat_col and cat_col in columns),
         "has_real_region": bool(reg_col and reg_col in columns and reg_col != cat_col),
         "has_real_date": bool(date_col and date_col in columns),
         "has_real_id": bool((order_col and order_col in columns) or (summary_orders_col and summary_orders_col in columns)),
-        "raw_rev_col": rev_col,
+        "raw_rev_col": authoritative_rev or gross_sales_col or payment_amount_col,
         "raw_cat_col": cat_col,
         "raw_reg_col": reg_col,
         "raw_date_col": date_col,
         "raw_id_col": order_col,
         "raw_name_col": cust_name_col,
-        "aov_col": aov_col if aov_col and aov_col in columns else None
+        "aov_col": aov_col if aov_col and aov_col in columns else None,
+        "profit": profit_expr,
+        "profit_available": profit_available,
+        "profit_source": profit_source,
+        "profit_note": profit_note,
+        "orders_aggregate": orders_aggregate,
+        "order_id": order_id_field,
+        "count_name": count_name,
+        "customers_aggregate": customers_aggregate,
+        "customer_id": customer_id_field,
+        "customer_name": customer_name_field,
+        "item_label": item_label,
+        "category": category_field,
+        "category_name": category_name,
+        "region": region_field,
+        "region_name": region_name,
+        "order_date": order_date_field,
+        "discounts_aggregate": discounts_aggregate,
+        "tax_aggregate": tax_aggregate,
+        "shipping_aggregate": shipping_aggregate,
+        "quantity_aggregate": quantity_aggregate,
+        "cost_aggregate": cost_aggregate,
+        "avg_price_aggregate": avg_price_aggregate,
+        "price_col": price_col,
+        "qty_col": qty_col,
+        "discount_col": discount_col,
+        "tax_col": tax_col,
+        "shipping_col": shipping_col,
+        "cost_col": cost_col,
+        "refund_col": refund_col,
+        "payment_col": payment_col
     }
-
-    # 1. Primary Metric / Revenue
-    if rev_col and rev_col in columns:
-        final_mapping["revenue"] = safe_col_expr(rev_col)
-        final_mapping["metric_name"] = rev_col.replace("_", " ").title()
-    elif qty_col and unit_price_col and qty_col in columns and unit_price_col in columns:
-        final_mapping["revenue"] = f"({safe_col_expr(qty_col)} * {safe_col_expr(unit_price_col)})"
-        final_mapping["metric_name"] = "Calculated Revenue"
-    elif unit_price_col and unit_price_col in columns:
-        final_mapping["revenue"] = safe_col_expr(unit_price_col)
-        final_mapping["metric_name"] = unit_price_col.replace("_", " ").title()
-    else:
-        final_mapping["revenue"] = "1"
-        final_mapping["metric_name"] = "Records Count"
-
-    # 2. Profit - STRICTLY DATA-DRIVEN LOGIC:
-    if profit_col and profit_col in columns:
-        final_mapping["profit"] = safe_col_expr(profit_col)
-        final_mapping["profit_source"] = "column"
-        final_mapping["profit_col"] = profit_col
-        final_mapping["profit_available"] = True
-        final_mapping["profit_note"] = None
-    elif margin_col and margin_col in columns and final_mapping.get("has_real_revenue"):
-        margin_clean = safe_col_expr(margin_col)
-        margin_mult = f"(CASE WHEN {margin_clean} > 1.0 THEN ({margin_clean} / 100.0) ELSE {margin_clean} END)"
-        final_mapping["profit"] = f"({final_mapping['revenue']} * {margin_mult})"
-        final_mapping["profit_source"] = "margin_column"
-        final_mapping["margin_col"] = margin_col
-        final_mapping["profit_available"] = True
-        final_mapping["profit_note"] = f"Calculated using dataset margin column '{margin_col}'"
-    elif user_margin is not None and final_mapping.get("has_real_revenue"):
-        margin_mult = user_margin / 100.0 if user_margin > 1.0 else user_margin
-        final_mapping["profit"] = f"({final_mapping['revenue']} * {margin_mult})"
-        final_mapping["profit_source"] = "user_margin"
-        final_mapping["user_margin"] = user_margin
-        final_mapping["profit_available"] = True
-        final_mapping["profit_note"] = f"Estimated using user-provided {user_margin}% profit margin"
-    else:
-        final_mapping["profit"] = None
-        final_mapping["profit_source"] = None
-        final_mapping["profit_available"] = False
-        final_mapping["profit_note"] = "Profit data unavailable"
-
-    # 3. Order ID & Aggregates
-    if summary_orders_col and summary_orders_col in columns:
-        final_mapping["orders_aggregate"] = f"SUM({safe_col_expr(summary_orders_col)})"
-        final_mapping["order_id"] = "1"
-        final_mapping["count_name"] = summary_orders_col.replace("_", " ").title()
-    elif order_col and order_col in columns:
-        final_mapping["order_id"] = quote_ident(order_col)
-        final_mapping["orders_aggregate"] = f"COUNT(DISTINCT {quote_ident(order_col)})"
-        final_mapping["count_name"] = order_col.replace("_", " ").title()
-    else:
-        final_mapping["order_id"] = "1"
-        final_mapping["orders_aggregate"] = "COUNT(*)"
-        final_mapping["count_name"] = "Total Records"
-
-    # 4. Customer ID & Aggregates
-    if summary_cust_col and summary_cust_col in columns:
-        final_mapping["customers_aggregate"] = f"SUM({safe_col_expr(summary_cust_col)})"
-        final_mapping["customer_id"] = "1"
-    elif cust_id_col and cust_id_col in columns:
-        final_mapping["customer_id"] = quote_ident(cust_id_col)
-        final_mapping["customers_aggregate"] = f"COUNT(DISTINCT {quote_ident(cust_id_col)})"
-    else:
-        final_mapping["customer_id"] = final_mapping["order_id"]
-        final_mapping["customers_aggregate"] = final_mapping["orders_aggregate"]
-
-    # 5. Customer Name / Item Name
-    if cust_name_col and cust_name_col in columns:
-        final_mapping["customer_name"] = quote_ident(cust_name_col)
-        final_mapping["item_label"] = cust_name_col.replace("_", " ").title()
-    elif order_col and order_col in columns:
-        final_mapping["customer_name"] = quote_ident(order_col)
-        final_mapping["item_label"] = order_col.replace("_", " ").title()
-    else:
-        final_mapping["customer_name"] = "'Item'"
-        final_mapping["item_label"] = "Item"
-
-    # 6. Category
-    if cat_col and cat_col in columns:
-        final_mapping["category"] = quote_ident(cat_col)
-        final_mapping["category_name"] = cat_col.replace("_", " ").title()
-    else:
-        final_mapping["category"] = "'General'"
-        final_mapping["category_name"] = "Category"
-
-    # 7. Region
-    if reg_col and reg_col in columns:
-        final_mapping["region"] = quote_ident(reg_col)
-        final_mapping["region_name"] = reg_col.replace("_", " ").title()
-    else:
-        final_mapping["region"] = "'Global'"
-        final_mapping["region_name"] = "Region"
-
-    # 8. Date
-    if date_col and date_col in columns:
-        final_mapping["order_date"] = quote_ident(date_col)
-    else:
-        final_mapping["order_date"] = None
 
     return final_mapping
 
@@ -337,9 +663,25 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     skipped_visualizations: list = []
 
     # Dynamic Metric Titles
-    primary_metric_title = f"Total {cols.get('metric_name', 'Metric')}"
+    has_rev = cols["has_real_revenue"]
     count_title = cols.get('count_name', 'Total Records')
-    avg_title = f"Average {cols.get('metric_name', 'Metric')}"
+
+    if has_rev:
+        primary_metric_title = f"Total {cols.get('metric_name', 'Metric')}"
+        avg_title = f"Average {cols.get('metric_name', 'Metric')}"
+    elif cols.get("revenue_source") == "price_only":
+        primary_metric_title = "Average Price"
+        avg_title = "Average Price"
+    elif cols.get("revenue_source") == "quantity_only":
+        primary_metric_title = "Total Quantity"
+        avg_title = "Average per Record"
+    elif cols.get("has_real_id") and cols.get("count_name"):
+        primary_metric_title = count_title
+        avg_title = "Average per Record"
+    else:
+        primary_metric_title = "Total Records"
+        avg_title = "Average per Record"
+
     category_title = f"{cols.get('category_name', 'Category')} Breakdown"
     region_title = f"{cols.get('region_name', 'Regional')} Distribution"
 
@@ -354,41 +696,59 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     # 1. Fetch KPI metrics (Isolated Query)
     orders_expr = cols.get("orders_aggregate") or "COUNT(*)"
     customers_expr = cols.get("customers_aggregate") or "COUNT(*)"
-    revenue_calc_expr = cols['revenue'] if cols["has_real_revenue"] else "COUNT(*)"
+    revenue_calc_expr = cols['revenue'] if has_rev else "1"
+    rev_kpi_expr = f"COALESCE(SUM({cols['revenue']}), 0)" if has_rev else "0.0"
+
+    gross_sales_kpi = f"COALESCE(SUM({cols['gross_sales']}), 0)" if cols.get("gross_sales") else rev_kpi_expr
+    discounts_kpi = f"COALESCE({cols['discounts_aggregate']}, 0)" if cols.get("discounts_aggregate") else "NULL"
+    tax_kpi = f"COALESCE({cols['tax_aggregate']}, 0)" if cols.get("tax_aggregate") else "NULL"
+    shipping_kpi = f"COALESCE({cols['shipping_aggregate']}, 0)" if cols.get("shipping_aggregate") else "NULL"
+    quantity_kpi = f"COALESCE({cols['quantity_aggregate']}, 0)" if cols.get("quantity_aggregate") else "NULL"
+    cost_kpi = f"COALESCE({cols['cost_aggregate']}, 0)" if cols.get("cost_aggregate") else "NULL"
+    avg_price_kpi = f"COALESCE({cols['avg_price_aggregate']}, 0)" if cols.get("avg_price_aggregate") else "NULL"
+    profit_kpi = f"COALESCE(SUM({cols['profit']}), 0)" if cols["profit_available"] and cols["profit"] is not None else "NULL"
 
     total_revenue = 0.0
+    gross_sales = None
+    total_discounts = None
+    total_tax = None
+    total_shipping = None
+    total_quantity = None
+    total_cost = None
+    average_price = None
     total_profit = None
     total_orders = 0
     total_customers = 0
 
     try:
-        if cols["profit_available"] and cols["profit"] is not None:
-            kpi_query = f"""
-            SELECT
-                COALESCE(SUM({revenue_calc_expr}), 0) AS total_revenue,
-                COALESCE(SUM({cols['profit']}), 0) AS total_profit,
-                COALESCE({orders_expr}, 0) AS total_orders,
-                COALESCE({customers_expr}, 0) AS total_customers
-            FROM {quoted_table}
-            """
-            kpi_res = db.execute(text(kpi_query)).fetchone()
-            total_revenue = float(kpi_res[0]) if kpi_res and kpi_res[0] is not None else 0.0
-            total_profit = float(kpi_res[1]) if kpi_res and kpi_res[1] is not None else 0.0
-            total_orders = int(kpi_res[2]) if kpi_res and kpi_res[2] is not None else 0
-            total_customers = int(kpi_res[3]) if kpi_res and kpi_res[3] is not None else 0
-        else:
-            kpi_query = f"""
-            SELECT
-                COALESCE(SUM({revenue_calc_expr}), 0) AS total_revenue,
-                COALESCE({orders_expr}, 0) AS total_orders,
-                COALESCE({customers_expr}, 0) AS total_customers
-            FROM {quoted_table}
-            """
-            kpi_res = db.execute(text(kpi_query)).fetchone()
-            total_revenue = float(kpi_res[0]) if kpi_res and kpi_res[0] is not None else 0.0
-            total_profit = None
-            total_orders = int(kpi_res[1]) if kpi_res and kpi_res[1] is not None else 0
-            total_customers = int(kpi_res[2]) if kpi_res and kpi_res[2] is not None else 0
+        kpi_query = f"""
+        SELECT
+            {rev_kpi_expr} AS total_revenue,
+            {gross_sales_kpi} AS gross_sales,
+            {discounts_kpi} AS total_discounts,
+            {tax_kpi} AS total_tax,
+            {shipping_kpi} AS total_shipping,
+            {quantity_kpi} AS total_quantity,
+            {cost_kpi} AS total_cost,
+            {avg_price_kpi} AS average_price,
+            {profit_kpi} AS total_profit,
+            COALESCE({orders_expr}, 0) AS total_orders,
+            COALESCE({customers_expr}, 0) AS total_customers
+        FROM {quoted_table}
+        """
+        kpi_res = db.execute(text(kpi_query)).fetchone()
+        if kpi_res:
+            total_revenue = float(kpi_res[0]) if kpi_res[0] is not None else 0.0
+            gross_sales = float(kpi_res[1]) if kpi_res[1] is not None else total_revenue
+            total_discounts = float(kpi_res[2]) if kpi_res[2] is not None else None
+            total_tax = float(kpi_res[3]) if kpi_res[3] is not None else None
+            total_shipping = float(kpi_res[4]) if kpi_res[4] is not None else None
+            total_quantity = float(kpi_res[5]) if kpi_res[5] is not None else None
+            total_cost = float(kpi_res[6]) if kpi_res[6] is not None else None
+            average_price = float(kpi_res[7]) if kpi_res[7] is not None else None
+            total_profit = float(kpi_res[8]) if kpi_res[8] is not None else None
+            total_orders = int(kpi_res[9]) if kpi_res[9] is not None else 0
+            total_customers = int(kpi_res[10]) if kpi_res[10] is not None else 0
     except Exception as e:
         # Fallback KPI calculation
         try:
@@ -581,10 +941,20 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     except Exception:
         top_customers = []
 
+    profit_margin = round((total_profit / total_revenue) * 100, 2) if total_profit is not None and total_revenue > 0 else None
+
     dashboard_result = {
         "metrics": {
             "total_revenue": round(total_revenue, 2),
+            "gross_sales": round(gross_sales, 2) if gross_sales is not None else None,
+            "total_discounts": round(total_discounts, 2) if total_discounts is not None else None,
+            "total_tax": round(total_tax, 2) if total_tax is not None else None,
+            "total_shipping": round(total_shipping, 2) if total_shipping is not None else None,
+            "total_quantity": round(total_quantity, 2) if total_quantity is not None else None,
+            "total_cost": round(total_cost, 2) if total_cost is not None else None,
+            "average_price": round(average_price, 2) if average_price is not None else None,
             "total_profit": round(total_profit, 2) if total_profit is not None else None,
+            "profit_margin": profit_margin,
             "total_orders": total_orders,
             "total_customers": total_customers,
             "average_order_value": round(average_order_value, 2),
