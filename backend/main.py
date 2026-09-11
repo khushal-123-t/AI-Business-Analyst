@@ -34,7 +34,7 @@ from backend.utils.auth import (
 from backend.models.schemas import (
     AskRequest, AskResponse, ChartConfig,
     DashboardResponse, SchemaResponse, HistoryItem,
-    LoginRequest, TokenResponse, UserOut, ClientOut,
+    LoginRequest, RegisterRequest, TokenResponse, UserOut, ClientOut,
     ClientCreate, ClientUpdate, ProfileUpdate,
     DatasetOut, ReportCreate, ReportOut, ClientProfileResponse,
     AdminDashboardResponse, AdminDashboardMetrics,
@@ -44,6 +44,7 @@ import logging
 logger = logging.getLogger("ai_analyst.api")
 
 from backend.services.sql_service import execute_query
+from backend.services.llm_provider import provider_manager
 from backend.services.llm_service import (
     generate_sql, generate_insights, add_history_context, extract_explicit_margin,
     LLMError, LLMConnectionError, LLMAuthError, LLMModelError, LLMEmptyResponse,
@@ -67,6 +68,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def on_startup():
+    """Validates Gemini configuration and system dependencies on startup."""
+    logger.info("Starting AI Business Analyst API (Gemini LLM Provider)...")
+    if settings.GEMINI_API_KEY:
+        logger.info(f"[Gemini] Configured with model '{settings.GEMINI_MODEL}'.")
+        print(f"[Gemini] Active LLM Provider: Gemini ({settings.GEMINI_MODEL}).")
+    else:
+        logger.warning("[Gemini] GEMINI_API_KEY is not configured in .env.")
+        print("WARNING: GEMINI_API_KEY is not configured in .env.")
+
 # Scope query history to client_id
 # Format: list of dicts: {"id": str, "client_id": int, "question": str, "timestamp": str, "sql": str, "chart_type": str}
 global_history_scoped = []
@@ -74,14 +86,14 @@ global_history_scoped = []
 def verify_sql_isolation(sql: str, allowed_table: str) -> bool:
     """
     Bulletproof regex validation to prevent SQL queries from referencing unauthorized tables.
-    Specifically checks table references in FROM, JOIN, INTO, UPDATE clauses.
+    Specifically checks table references in FROM, JOIN, INTO, UPDATE clauses and comma joins.
     """
     inspector = inspect(engine)
     all_tables = inspector.get_table_names()
     for table in all_tables:
         if table.lower() != allowed_table.lower():
             # Specifically check if the unauthorized table is queried as a table source
-            pattern = rf"\b(FROM|JOIN|INTO|UPDATE)\s+[`\"']?{re.escape(table)}[`\"']?\b"
+            pattern = rf"(?:\b(FROM|JOIN|INTO|UPDATE)\s+|,)\s*[`\"']?{re.escape(table)}[`\"']?\b"
             if re.search(pattern, sql, re.IGNORECASE):
                 return False
     return True
@@ -90,14 +102,16 @@ def verify_sql_isolation(sql: str, allowed_table: str) -> bool:
 
 @app.get("/api/health")
 def health_check():
-    """Health check endpoint verifying backend and database connectivity."""
+    """Health check endpoint verifying backend, database, and LLM provider connectivity."""
     try:
         inspector = inspect(engine)
         tables = inspector.get_table_names()
+        llm_status = provider_manager.get_status()
         return {
             "status": "connected",
             "database": "business.db",
             "tables_count": len(tables),
+            "llm": llm_status,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
@@ -145,6 +159,81 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         token_type="bearer",
         role=user.role,
         name=user.name
+    )
+
+@app.post("/auth/register", response_model=TokenResponse)
+def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    """Registers a new Client account and linked User, returning authentication token."""
+    email_clean = req.email.strip().lower()
+    name_clean = req.full_name.strip()
+    if not email_clean or not name_clean or not req.password:
+        raise HTTPException(status_code=400, detail="All fields are required")
+    
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
+
+    # Check email uniqueness in users and clients
+    existing_user = db.query(User).filter(User.email == email_clean).first()
+    existing_client = db.query(Client).filter(Client.email == email_clean).first()
+    if existing_user or existing_client:
+        raise HTTPException(status_code=400, detail="An account with this email address already exists")
+
+    company = req.company_name or f"{name_clean}'s Workspace"
+    new_client = Client(
+        company_name=company,
+        contact_name=name_clean,
+        email=email_clean,
+        status="ACTIVE",
+        plan="FREE",
+        created_at=datetime.utcnow()
+    )
+    db.add(new_client)
+    db.commit()
+    db.refresh(new_client)
+
+    new_user = User(
+        name=name_clean,
+        email=email_clean,
+        password_hash=get_password_hash(req.password),
+        role="CLIENT",
+        client_id=new_client.id,
+        is_active=True,
+        created_at=datetime.utcnow(),
+        last_login=datetime.utcnow()
+    )
+    db.add(new_user)
+    db.commit()
+
+    # Seed isolated table by copying original sales table if it exists
+    inspector = inspect(engine)
+    if "sales" in inspector.get_table_names():
+        seed_table = f"dataset_client_{new_client.id}_seed"
+        try:
+            db.execute(text(f"CREATE TABLE `{seed_table}` AS SELECT * FROM sales"))
+            db.commit()
+            row_count = db.execute(text(f"SELECT COUNT(*) FROM `{seed_table}`")).scalar()
+            col_count = len(inspector.get_columns("sales"))
+            dataset = Dataset(
+                client_id=new_client.id,
+                name="Default Sales Dataset",
+                filename="sales_data.csv",
+                table_name=seed_table,
+                row_count=row_count,
+                col_count=col_count,
+                status="ACTIVE",
+                created_at=datetime.utcnow()
+            )
+            db.add(dataset)
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Could not seed default table for client {new_client.id}: {e}")
+
+    access_token = create_access_token(data={"sub": new_user.email, "role": new_user.role})
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        role=new_user.role,
+        name=new_user.name
     )
 
 @app.get("/auth/me", response_model=UserOut)
@@ -478,7 +567,7 @@ LIBRARY_DATASETS = [
 ]
 
 def parse_uploaded_file_to_df(filename: str, contents: bytes) -> pd.DataFrame:
-    """Intelligently parses uploaded dataset files (CSV, XLSX, XLS, JSON, TSV, TXT) across encodings and delimiters."""
+    """Intelligently and rapidly parses uploaded dataset files across formats, encodings, and delimiters using fast C-engine."""
     if not contents or len(contents) == 0:
         raise HTTPException(
             status_code=400,
@@ -536,25 +625,40 @@ def parse_uploaded_file_to_df(filename: str, contents: bytes) -> pd.DataFrame:
                     detail=f"Failed to parse JSON file: {str(je)}. Please ensure it is a valid JSON array or object."
                 )
 
-    # 3. Handle Delimited Text / CSV / TSV / TXT
+    # 3. Handle Delimited Text / CSV / TSV / TXT with fast C-engine
+    # Fast delimiter detection by sampling the first 4KB of content
+    sample_bytes = contents[:4096]
+    detected_sep = ','
+    if fn_lower.endswith('.tsv'):
+        detected_sep = '\t'
+    else:
+        try:
+            sample_text = sample_bytes.decode('utf-8', errors='ignore')
+            counts = {',': sample_text.count(','), '\t': sample_text.count('\t'), ';': sample_text.count(';'), '|': sample_text.count('|')}
+            detected_sep = max(counts, key=counts.get) if max(counts.values()) > 0 else ','
+        except Exception:
+            detected_sep = ','
+
+    # Priority delimiters: detected delimiter first, followed by standard candidates
+    delimiters = [detected_sep]
+    for d in [',', '\t', ';', '|']:
+        if d not in delimiters:
+            delimiters.append(d)
+
     encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
-    delimiters = ['\t', None, ','] if fn_lower.endswith('.tsv') else [None, ',', ';', '\t', '|']
     last_err = None
+
+    # Fast path: C engine with detected delimiter and standard encodings
     for enc in encodings:
         for sep in delimiters:
             try:
-                kwargs = {"encoding": enc}
-                if sep is None:
-                    kwargs["sep"] = None
-                    kwargs["engine"] = "python"
-                else:
-                    kwargs["sep"] = sep
-                
-                try:
-                    df = pd.read_csv(io.BytesIO(contents), **kwargs)
-                except Exception:
-                    df = pd.read_csv(io.BytesIO(contents), **kwargs, on_bad_lines='skip')
-                
+                df = pd.read_csv(
+                    io.BytesIO(contents),
+                    sep=sep,
+                    encoding=enc,
+                    engine='c',
+                    low_memory=False
+                )
                 if df is not None and len(df.columns) > 0:
                     if df.empty:
                         raise HTTPException(status_code=400, detail="The uploaded file contains headers but no data rows.")
@@ -564,6 +668,26 @@ def parse_uploaded_file_to_df(filename: str, contents: bytes) -> pd.DataFrame:
             except Exception as ex:
                 last_err = ex
                 continue
+
+    # Fallback path with on_bad_lines='skip'
+    for enc in ['utf-8', 'latin1']:
+        try:
+            df = pd.read_csv(
+                io.BytesIO(contents),
+                sep=None,
+                encoding=enc,
+                engine='python',
+                on_bad_lines='skip'
+            )
+            if df is not None and len(df.columns) > 0:
+                if df.empty:
+                    raise HTTPException(status_code=400, detail="The uploaded file contains headers but no data rows.")
+                return df
+        except HTTPException:
+            raise
+        except Exception as ex:
+            last_err = ex
+            continue
 
     raise HTTPException(
         status_code=400,
@@ -597,51 +721,57 @@ def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def clean_dataframe_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Intelligently identifies and cleans columns containing currency-formatted strings,
-    comma-separated numbers, or percentages (e.g. '$177,134,263.74', '₹199', '1,099', '64%')
-    so that SQLite receives them as native REAL/BIGINT types for accurate mathematical aggregations.
+    Rapid sample-based type inference: checks a 300-row sample to identify currency,
+    comma-formatted numbers, or percentages, avoiding full-column regex passes for pure text.
     """
-    df = df.copy()
-    for col in df.columns:
-        try:
-            dtype_str = str(df[col].dtype)
-            if df[col].dtype == 'object' or 'str' in dtype_str or df[col].dtype.kind in ('O', 'S', 'U'):
-                non_null = df[col].dropna()
-                non_null = non_null[non_null.astype(str).str.strip() != '']
-                if len(non_null) == 0:
-                    continue
-                
-                sample_str = non_null.astype(str).str.strip()
-                
-                # Avoid converting dates or date ranges (e.g. '2021-01-01', '2021-01-01 to 2025-12-31')
-                if sample_str.str.contains(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}', regex=True).mean() > 0.5:
-                    continue
-                if sample_str.str.contains(r'\bto\b|\bthrough\b', case=False, regex=True).any():
-                    continue
+    sample_size = min(300, len(df))
+    if sample_size == 0:
+        return df
 
-                # Strip currency symbols ($ ₹ € £ ¥), common prefixes (Rs., Rs, INR, USD), commas, and spaces
-                cleaned = sample_str.str.replace(r'[\$,₹€£¥\s]', '', regex=True)
-                cleaned = cleaned.str.replace(r'^[Rr][Ss]\.?', '', regex=True)
-                cleaned = cleaned.str.replace(',', '', regex=False)
-                cleaned = cleaned.str.rstrip('%')
-                
-                parsed = pd.to_numeric(cleaned, errors='coerce')
-                valid_ratio = parsed.notnull().sum() / len(sample_str)
-                has_digits = sample_str.str.contains(r'\d', regex=True).mean() > 0.5
-                
-                # If >= 70% of non-null values parse as numbers, convert the column
-                if valid_ratio >= 0.7 and has_digits:
-                    full_cleaned = df[col].astype(str).str.strip().str.replace(r'[\$,₹€£¥\s]', '', regex=True)
-                    full_cleaned = full_cleaned.str.replace(r'^[Rr][Ss]\.?', '', regex=True)
-                    full_cleaned = full_cleaned.str.replace(',', '', regex=False)
-                    full_cleaned = full_cleaned.str.rstrip('%')
-                    converted = pd.to_numeric(full_cleaned, errors='coerce')
-                    # Ensure conversion preserves the vast majority of data
-                    if converted.notnull().sum() >= valid_ratio * len(non_null):
-                        df[col] = converted
-        except Exception as col_err:
-            logger.warning(f"clean_dataframe_numeric_columns: skipped col '{col}': {col_err}")
+    for col in df.columns:
+        # Fast exit: if already numeric, skip
+        if pd.api.types.is_numeric_dtype(df[col]):
             continue
+
+        try:
+            sample = df[col].dropna().head(sample_size)
+            if len(sample) == 0:
+                continue
+
+            sample_str = sample.astype(str).str.strip()
+
+            # Fast skip: date patterns (e.g. '2024-01-01', '2024/01/01')
+            if sample_str.str.contains(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}', regex=True).mean() > 0.5:
+                continue
+            if sample_str.str.contains(r'\bto\b|\bthrough\b', case=False, regex=True).any():
+                continue
+
+            # Fast skip: pure text without digits
+            has_digits = sample_str.str.contains(r'\d', regex=True).mean() > 0.5
+            if not has_digits:
+                continue
+
+            # Test numeric conversion on the sample first
+            sample_cleaned = sample_str.str.replace(r'[\$,₹€£¥\s]', '', regex=True)
+            sample_cleaned = sample_cleaned.str.replace(r'^[Rr][Ss]\.?', '', regex=True)
+            sample_cleaned = sample_cleaned.str.replace(',', '', regex=False)
+            sample_cleaned = sample_cleaned.str.rstrip('%')
+            parsed_sample = pd.to_numeric(sample_cleaned, errors='coerce')
+            valid_ratio = parsed_sample.notnull().sum() / len(sample_str)
+
+            # If >= 70% of non-null sample parses as numbers, perform a single vectorized pass on full column
+            if valid_ratio >= 0.7:
+                full_cleaned = df[col].astype(str).str.strip().str.replace(r'[\$,₹€£¥\s]', '', regex=True)
+                full_cleaned = full_cleaned.str.replace(r'^[Rr][Ss]\.?', '', regex=True)
+                full_cleaned = full_cleaned.str.replace(',', '', regex=False)
+                full_cleaned = full_cleaned.str.rstrip('%')
+                converted = pd.to_numeric(full_cleaned, errors='coerce')
+                if converted.notnull().sum() >= valid_ratio * len(df[col].dropna()):
+                    df[col] = converted
+        except Exception as col_err:
+            logger.debug(f"clean_dataframe_numeric_columns: skipped col '{col}': {col_err}")
+            continue
+
     return df
 
 def generate_library_dataframe(library_id: str) -> tuple[pd.DataFrame, str]:
@@ -756,6 +886,7 @@ def import_client_library_dataset(
 ):
     """Imports a pre-configured library dataset into an isolated table for the client."""
     try:
+        t_start = time.perf_counter()
         df, standard_fn = generate_library_dataframe(req.library_id)
         df = sanitize_dataframe_columns(df)
         df = clean_dataframe_numeric_columns(df)
@@ -770,13 +901,11 @@ def import_client_library_dataset(
         table_uuid = uuid.uuid4().hex[:12]
         table_name = f"dataset_client_{current_user.client_id}_{table_uuid}"
 
-        # Write to SQLite database safely using connection or engine
-        try:
-            df.to_sql(table_name, db.connection(), if_exists="replace", index=False, chunksize=1000)
-        except Exception as sql_ex:
-            logger.warning(f"import_client_library_dataset: db.connection().to_sql failed ({sql_ex}), falling back to engine.begin()")
-            with engine.begin() as conn:
-                df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=1000)
+        chunk_size = getattr(settings, "CSV_CHUNK_SIZE", 10000)
+        with engine.begin() as conn:
+            conn.execute(text("PRAGMA synchronous = NORMAL"))
+            conn.execute(text("PRAGMA journal_mode = WAL"))
+            df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=chunk_size)
 
         new_dataset = Dataset(
             client_id=current_user.client_id,
@@ -792,13 +921,11 @@ def import_client_library_dataset(
         db.commit()
         db.refresh(new_dataset)
 
-        # Invalidate and pre-warm cache for instant dashboard rendering
+        # Invalidate cached metrics so future queries get fresh calculations on-demand
         invalidate_dashboard_cache(table_name)
-        try:
-            get_dashboard_data(db, table_name=table_name)
-        except Exception as e:
-            logger.info(f"Pre-warm dashboard cache note: {e}")
-
+        
+        t_total = time.perf_counter() - t_start
+        logger.info(f"[LibraryImport] Imported '{ds_name}' ({row_count:,} rows) in {t_total:.3f}s")
         return new_dataset
     except HTTPException:
         db.rollback()
@@ -817,7 +944,11 @@ async def upload_client_dataset(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_client)
 ):
-    """Securely uploads and imports dataset files (CSV, XLSX, XLS, JSON, TSV, TXT) into an isolated database table linked to the client's ID."""
+    """Securely uploads and imports dataset files into an isolated database table with comprehensive stage performance timing."""
+    t_start = time.perf_counter()
+    
+    # 1. Validation: extension
+    t_val_start = time.perf_counter()
     fn_lower = (file.filename or '').lower()
     valid_extensions = ('.csv', '.xlsx', '.xls', '.tsv', '.txt', '.json')
     if not fn_lower.endswith(valid_extensions):
@@ -827,30 +958,43 @@ async def upload_client_dataset(
         )
 
     try:
+        # 2. File upload / receiving bytes
+        t_read_start = time.perf_counter()
         contents = await file.read()
+        t_read = time.perf_counter() - t_read_start
+
         if not contents or len(contents) == 0:
             raise HTTPException(
                 status_code=400,
                 detail="The uploaded file is empty (0 bytes). Please select a valid file with data."
             )
 
+        # 3. CSV parsing
+        t_parse_start = time.perf_counter()
         df = parse_uploaded_file_to_df(file.filename or 'data.csv', contents)
-        df = sanitize_dataframe_columns(df)
-        df = clean_dataframe_numeric_columns(df)
-        
+        t_parse = time.perf_counter() - t_parse_start
+
+        # 4. Data validation
         row_count = len(df)
         col_count = len(df.columns)
+        t_val = (time.perf_counter() - t_val_start) - t_read - t_parse
         if row_count == 0 or col_count == 0:
             raise HTTPException(
                 status_code=400,
                 detail="The dataset file contains no rows or tabular columns to import."
             )
 
-        # Generate unique, non-guessable, isolated table name
+        # 5. Data cleaning
+        t_clean_start = time.perf_counter()
+        df = sanitize_dataframe_columns(df)
+        df = clean_dataframe_numeric_columns(df)
+        t_clean = time.perf_counter() - t_clean_start
+
+        # 6. Table creation & preparation
+        t_prep_start = time.perf_counter()
         table_uuid = uuid.uuid4().hex[:12]
         table_name = f"dataset_client_{current_user.client_id}_{table_uuid}"
 
-        # Clean display name and handle duplicate filenames gracefully
         clean_name = (name or "").strip()
         if not clean_name:
             clean_name = file.filename.rsplit('.', 1)[0] if file.filename else "Uploaded Dataset"
@@ -861,15 +1005,32 @@ async def upload_client_dataset(
         while final_name.lower() in existing_names:
             final_name = f"{clean_name} ({counter})"
             counter += 1
+        t_prep = time.perf_counter() - t_prep_start
 
-        # Write to SQLite database safely using connection or engine
-        try:
-            df.to_sql(table_name, db.connection(), if_exists="replace", index=False, chunksize=1000)
-        except Exception as sql_ex:
-            logger.warning(f"upload_client_dataset: db.connection().to_sql failed ({sql_ex}), falling back to engine.begin()")
-            with engine.begin() as conn:
-                df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=1000)
+        # 7. Database insertion (batched bulk insertion with WAL optimization)
+        t_insert_start = time.perf_counter()
+        chunk_size = getattr(settings, "CSV_CHUNK_SIZE", 10000)
+        with engine.begin() as conn:
+            conn.execute(text("PRAGMA synchronous = NORMAL"))
+            conn.execute(text("PRAGMA journal_mode = WAL"))
+            df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=chunk_size)
+        t_insert = time.perf_counter() - t_insert_start
 
+        # 8. Schema detection
+        t_schema_start = time.perf_counter()
+        inspector = inspect(engine)
+        detected_cols = inspector.get_columns(table_name)
+        t_schema = time.perf_counter() - t_schema_start
+
+        # 9 & 10. Data profiling & AI calls: strictly 0s (separated from upload)
+        t_profile = 0.0
+        t_ai = 0.0
+
+        # Invalidate cache so future queries calculate fresh on demand
+        invalidate_dashboard_cache(table_name)
+
+        # 11. Final response & metadata persistence
+        t_resp_start = time.perf_counter()
         new_dataset = Dataset(
             client_id=current_user.client_id,
             name=final_name,
@@ -883,13 +1044,32 @@ async def upload_client_dataset(
         db.add(new_dataset)
         db.commit()
         db.refresh(new_dataset)
+        t_resp = time.perf_counter() - t_resp_start
+        t_total = time.perf_counter() - t_start
 
-        # Invalidate and pre-warm cache for instant dashboard rendering
-        invalidate_dashboard_cache(table_name)
-        try:
-            get_dashboard_data(db, table_name=table_name)
-        except Exception as e:
-            logger.info(f"Pre-warm dashboard cache note: {e}")
+        # Structured backend timing log
+        file_mb = len(contents) / (1024 * 1024)
+        timing_report = (
+            f"\n============================================================\n"
+            f"DATASET UPLOAD TIMING BREAKDOWN: '{file.filename}' ({file_mb:.2f} MB)\n"
+            f"------------------------------------------------------------\n"
+            f"1. File upload/receiving     : {t_read:.3f}s\n"
+            f"2. File saving (in-memory)   : {t_read:.3f}s\n"
+            f"3. CSV parsing               : {t_parse:.3f}s ({row_count:,} rows, {col_count} columns)\n"
+            f"4. Data validation           : {max(0.0, t_val):.3f}s\n"
+            f"5. Data cleaning             : {t_clean:.3f}s\n"
+            f"6. Table creation & prep     : {t_prep:.3f}s\n"
+            f"7. Database insertion        : {t_insert:.3f}s (chunksize={chunk_size})\n"
+            f"8. Schema detection          : {t_schema:.3f}s ({len(detected_cols)} verified columns)\n"
+            f"9. Data profiling            : {t_profile:.3f}s (deferred to on-demand query)\n"
+            f"10. AI/LLM calls             : {t_ai:.3f}s (separated from upload)\n"
+            f"11. Final response & commit  : {t_resp:.3f}s\n"
+            f"------------------------------------------------------------\n"
+            f"TOTAL PROCESSING TIME        : {t_total:.3f}s\n"
+            f"============================================================"
+        )
+        logger.info(timing_report)
+        print(timing_report)
 
         return new_dataset
     except HTTPException:
@@ -1196,7 +1376,7 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
                 summary="LLM Authentication failed. Please verify your GEMINI_API_KEY in .env.",
                 key_findings=["Invalid or missing Gemini API key."],
                 business_impact="AI SQL generation is offline due to authentication credentials.",
-                recommendations=["Check GEMINI_API_KEY in .env file or switch to LLM_PROVIDER=ollama."],
+                recommendations=["Check GEMINI_API_KEY in .env file."],
                 success=False, error=f"LLM_AUTH_ERROR: {str(e)}"
             )
         except (LLMModelError, LLMConnectionError) as e:
@@ -1204,11 +1384,14 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
             return AskResponse(
                 question=question, sql="", columns=[], rows=[],
                 chart=ChartConfig(chart_type="none", data=[]),
-                summary="AI Analyst service is temporarily unavailable or rate limited.",
-                key_findings=[f"Provider error detail: {str(e)}"],
-                business_impact="Unable to reach AI language model service.",
-                recommendations=["Wait a few moments and retry, or configure a fallback model in GEMINI_MODEL."],
-                success=False, error=f"LLM_MODEL_ERROR: {str(e)}"
+                summary="AI Analyst service is temporarily unavailable.",
+                key_findings=[f"Provider error: {str(e)}"],
+                business_impact="Unable to complete generation with active AI provider.",
+                recommendations=[
+                    f"Check your Gemini API connection and ensure '{settings.GEMINI_MODEL}' is active.",
+                    "Verify GEMINI_API_KEY in .env file."
+                ],
+                success=False, error=f"LLM_PROVIDER_ERROR: {str(e)}"
             )
         except SQLValidationError as e:
             logger.error(f"[/api/ask] SQL Validation Error: {str(e)}")

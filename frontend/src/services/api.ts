@@ -6,20 +6,32 @@ import type {
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
+function handleAuthExpiry() {
+  localStorage.removeItem('token');
+  localStorage.removeItem('role');
+  localStorage.removeItem('userName');
+  if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+    window.location.href = '/login?expired=1';
+  }
+}
+
 function getHeaders(contentType: string | null = 'application/json'): Record<string, string> {
   const headers: Record<string, string> = {};
   if (contentType) {
     headers['Content-Type'] = contentType;
   }
   const token = localStorage.getItem('token');
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+  if (token && token.trim() && token !== 'undefined' && token !== 'null') {
+    headers['Authorization'] = `Bearer ${token.trim()}`;
   }
   return headers;
 }
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
+    if (response.status === 401) {
+      handleAuthExpiry();
+    }
     let errorText = '';
     try {
       const errorJson = await response.json();
@@ -44,6 +56,16 @@ export const api = {
     localStorage.setItem('token', data.access_token);
     localStorage.setItem('role', data.role);
     localStorage.setItem('userName', data.name);
+    return { access_token: data.access_token, role: data.role, name: data.name };
+  },
+
+  async register(fullName: string, email: string, password: string, companyName?: string): Promise<{ access_token: string; role: string; name: string }> {
+    const res = await fetch(`${API_URL}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ full_name: fullName, email, password, company_name: companyName })
+    });
+    const data = await handleResponse<{ access_token: string; token_type: string; role: string; name: string }>(res);
     return { access_token: data.access_token, role: data.role, name: data.name };
   },
 
@@ -176,16 +198,60 @@ export const api = {
     return handleResponse(res);
   },
 
-  async uploadDataset(name: string, file: File): Promise<Dataset> {
-    const formData = new FormData();
-    formData.append('name', name);
-    formData.append('file', file);
-    const res = await fetch(`${API_URL}/client/datasets`, {
-      method: 'POST',
-      headers: getHeaders(null), // multipart boundary will be auto-set by the browser
-      body: formData
+  async uploadDataset(
+    name: string, 
+    file: File, 
+    onUploadProgress?: (percent: number, loaded: number, total: number) => void
+  ): Promise<Dataset> {
+    return new Promise((resolve, reject) => {
+      const formData = new FormData();
+      formData.append('name', name);
+      formData.append('file', file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_URL}/client/datasets`);
+
+      const headers = getHeaders(null);
+      Object.keys(headers).forEach(key => {
+        xhr.setRequestHeader(key, headers[key]);
+      });
+
+      if (xhr.upload && onUploadProgress) {
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percent = Math.round((event.loaded / event.total) * 100);
+            onUploadProgress(percent, event.loaded, event.total);
+          }
+        };
+      }
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            resolve(data);
+          } catch {
+            resolve(xhr.responseText as any);
+          }
+        } else {
+          if (xhr.status === 401) {
+            handleAuthExpiry();
+          }
+          try {
+            const errData = JSON.parse(xhr.responseText);
+            reject(new Error(errData.detail || 'Upload failed'));
+          } catch {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        }
+      };
+
+      xhr.onerror = () => {
+        reject(new Error('Network error during dataset upload. Please check connection.'));
+      };
+
+      xhr.send(formData);
     });
-    return handleResponse(res);
   },
 
   async deleteDataset(id: number): Promise<any> {

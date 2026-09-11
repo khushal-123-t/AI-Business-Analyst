@@ -236,7 +236,7 @@ ${msg.response.sql}
             <div className="space-y-3">
               <h2 className="text-lg font-bold text-slate-100 tracking-tight">Ask anything about your uploaded dataset...</h2>
               <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
-                Gemini will inspect your custom schemas, execute safe SQLite analytical queries, draw charts, and write business action reports.
+                The AI Analyst will inspect your custom schemas, execute safe SQLite analytical queries, draw charts, and write business action reports.
               </p>
             </div>
 
@@ -275,7 +275,7 @@ ${msg.response.sql}
                     ) : (
                       <>
                         <Sparkles className="h-3 w-3 text-indigo-400" />
-                        <span className="text-indigo-400">Gemini Analyst</span>
+                        <span className="text-indigo-400">AI Analyst</span>
                         <div className="h-1.5 w-1.5 rounded-full bg-indigo-500" />
                       </>
                     )}

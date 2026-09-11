@@ -1,58 +1,27 @@
 import os
 import re
 import json
-import urllib.request
-import urllib.error
 from typing import List, Dict, Any, Optional
 
 from backend.config import settings
 from backend.services.sql_service import get_db_schema
 from backend.utils.sql_validator import is_safe_sql
+from backend.services.llm_provider import (
+    provider_manager,
+    LLMError,
+    LLMConnectionError,
+    LLMAuthError,
+    LLMModelError,
+    LLMEmptyResponse,
+    SQLExtractionError,
+    SQLValidationError,
+    CannotAnswerError,
+    GeminiProvider,
+    LLMProviderManager
+)
 
 import logging
 logger = logging.getLogger("ai_analyst.llm")
-
-# --- Categorized Error Classes ---
-class LLMError(Exception):
-    """Base class for LLM service exceptions."""
-    pass
-
-class LLMConnectionError(LLMError):
-    """Cannot connect to LLM provider."""
-    pass
-
-class LLMAuthError(LLMError):
-    """Authentication failed (missing or bad API key)."""
-    pass
-
-class LLMModelError(LLMError):
-    """Model unavailable, not found, or quota exceeded."""
-    pass
-
-class LLMEmptyResponse(LLMError):
-    """LLM returned an empty response."""
-    pass
-
-class SQLExtractionError(LLMError):
-    """Could not extract valid SQL from LLM response."""
-    pass
-
-class SQLValidationError(LLMError):
-    """Generated SQL failed security/syntax validation."""
-    pass
-
-class CannotAnswerError(LLMError):
-    """The question cannot be answered from the available schema."""
-    pass
-
-# Gemini client initialization (if API key available)
-gemini_client = None
-if settings.GEMINI_API_KEY:
-    try:
-        from google import genai
-        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    except Exception as e:
-        logger.warning(f"Warning: Could not initialize Google GenAI SDK: {str(e)}")
 
 # In-memory session manager for conversational history
 # session_id -> list of dicts: [{"question": str, "sql": str, "summary": str}]
@@ -99,11 +68,12 @@ def format_schema() -> str:
 
 
 def clean_generated_sql(sql_text: str) -> str:
-    """Extracts raw SQL from Markdown code blocks or natural language responses."""
+    """Extracts raw SQL from Markdown code blocks, <think> tags, or natural language responses."""
     if not sql_text:
         return ""
     
-    cleaned_input = sql_text.strip()
+    # Strip <think>...</think> tags if reasoning models (e.g. Qwen, DeepSeek) output them
+    cleaned_input = re.sub(r"<think>.*?</think>", "", sql_text, flags=re.DOTALL).strip()
     if cleaned_input.upper() == "CANNOT_ANSWER":
         return "CANNOT_ANSWER"
 
@@ -118,6 +88,9 @@ def clean_generated_sql(sql_text: str) -> str:
             extracted = match.group(1).strip()
         else:
             extracted = cleaned_input
+
+    # Strip any remaining think tags that might have been inside code blocks
+    extracted = re.sub(r"<think>.*?</think>", "", extracted, flags=re.DOTALL).strip()
 
     if extracted.upper() == "CANNOT_ANSWER":
         return "CANNOT_ANSWER"
@@ -135,126 +108,12 @@ def clean_generated_sql(sql_text: str) -> str:
     return extracted
 
 
-def call_gemini(system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
-    """Invokes Google Gemini with resilient candidate model fallback handling."""
-    if not settings.GEMINI_API_KEY:
-        raise LLMAuthError(
-            "Gemini API key is missing. Set GEMINI_API_KEY in your .env file or switch to LLM_PROVIDER=ollama to use free local models."
-        )
-
-    global gemini_client
-    if not gemini_client:
-        try:
-            from google import genai
-            gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        except Exception as e:
-            logger.error(f"GEMINI API ERROR: Could not initialize SDK: {str(e)}")
-            raise LLMConnectionError(f"Could not initialize Google GenAI SDK: {str(e)}")
-
-    primary_model = settings.GEMINI_MODEL or "gemini-3.5-flash"
-    # Fallback model hierarchy prioritizing active models
-    candidate_models = [primary_model, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
-    unique_candidates = list(dict.fromkeys(candidate_models))
-
-    from google.genai import types
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        temperature=temperature,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-    )
-
-    last_err = None
-    for model_name in unique_candidates:
-        try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=user_prompt,
-                config=config
-            )
-            if response and response.text and response.text.strip():
-                return response.text.strip()
-            raise LLMEmptyResponse(f"Gemini model '{model_name}' returned empty response text.")
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            logger.warning(f"GEMINI API ERROR: Model '{model_name}' failed: {err_str}")
-            
-            # Authentication failure is terminal
-            if "API_KEY_INVALID" in err_str or "PERMISSION_DENIED" in err_str:
-                raise LLMAuthError(f"Gemini API Authentication Error: {err_str}")
-            
-            # Quota/Not-found/Unavailable: try next candidate model
-            if any(k in err_str for k in ("NOT_FOUND", "RESOURCE_EXHAUSTED", "429", "404", "503", "UNAVAILABLE")):
-                continue
-            
-            continue
-
-    logger.error(f"GEMINI API ERROR: All candidate models failed ({unique_candidates}). Last error: {str(last_err)}")
-    raise LLMModelError(f"Gemini API Error: All models ({', '.join(unique_candidates)}) failed. Detail: {str(last_err)}")
-
-
 def call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
     """
-    Unified LLM invocation function supporting:
-    1. Cloud Models via Google Gemini (Gemini 3.5 Flash, etc.)
-    2. Local Pre-Trained Models via Ollama (Llama 3.2, Llama 3.3, Mistral, Qwen, etc.)
-    Includes automatic graceful fallback between providers.
+    Unified LLM invocation function forwarding to LLMProviderManager.
+    Sole AI Provider: Google Gemini
     """
-    provider = settings.LLM_PROVIDER.lower()
-
-    if provider == "gemini":
-        try:
-            return call_gemini(system_prompt, user_prompt, temperature=temperature)
-        except Exception as e:
-            raise e
-
-    elif provider == "ollama":
-        url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-        payload = {
-            "model": settings.OLLAMA_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "stream": False,
-            "options": {
-                "temperature": temperature
-            }
-        }
-        data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            headers={"Content-Type": "application/json"}
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                content = resp_data.get("message", {}).get("content", "").strip()
-                if not content:
-                    raise LLMEmptyResponse("Ollama returned empty response.")
-                return content
-        except urllib.error.URLError as e:
-            # If Ollama is not running, fallback to Gemini if API key is present
-            if settings.GEMINI_API_KEY:
-                logger.warning(f"Ollama server unreachable at {settings.OLLAMA_BASE_URL}. Falling back to Gemini API.")
-                return call_gemini(system_prompt, user_prompt, temperature=temperature)
-            raise LLMConnectionError(
-                f"Cannot connect to local Ollama server at {settings.OLLAMA_BASE_URL} ({str(e.reason)}).\n"
-                f"Please ensure Ollama is installed and running on your machine, or configure GEMINI_API_KEY in .env."
-            )
-        except Exception as e:
-            if settings.GEMINI_API_KEY:
-                logger.warning(f"Ollama error ({str(e)}). Falling back to Gemini API.")
-                return call_gemini(system_prompt, user_prompt, temperature=temperature)
-            raise LLMModelError(f"Ollama generation error with model '{settings.OLLAMA_MODEL}': {str(e)}")
-
-    else:
-        # Default fallback
-        if settings.GEMINI_API_KEY:
-            return call_gemini(system_prompt, user_prompt, temperature=temperature)
-        raise ValueError(f"Unsupported LLM_PROVIDER '{provider}'. Supported providers: 'gemini', 'ollama'.")
+    return provider_manager.call_llm(system_prompt, user_prompt, temperature=temperature)
 
 
 def extract_explicit_margin(text: str) -> Optional[float]:
@@ -269,10 +128,10 @@ def extract_explicit_margin(text: str) -> Optional[float]:
     if not text:
         return None
     patterns = [
-        r"(?:assume|using|with|at|apply|consider|suppose)\s*(?:a\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:profit\s+)?margin",
+        r"(?:assume|assuming|using|with|at|apply|consider|suppose)\s*(?:a\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:profit\s+)?margin",
         r"(?:profit\s+)?margin\s*(?:of|is|=|:|at)\s*(\d+(?:\.\d+)?)\s*%",
         r"(\d+(?:\.\d+)?)\s*%\s*profit\s+margin",
-        r"assume\s*(\d+(?:\.\d+)?)\s*%\s*(?:profit|margin)"
+        r"(?:assume|assuming)\s*(?:a\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:profit|margin)"
     ]
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
@@ -295,6 +154,7 @@ def generate_sql(
     """
     Translates a natural language question into safe SQLite SQL.
     Strictly data-driven: never assumes or invents default profit margins.
+    Uses Gemini as sole AI provider.
     """
     if user_margin is None:
         user_margin = extract_explicit_margin(question)
@@ -352,9 +212,10 @@ Never invent metrics.
 Never assume a profit margin.
 Never use information outside the supplied dataset.
 
-Return ONLY the SQL query.
-Do not return explanations.
-Do not use Markdown code fences.
+Return ONLY the raw SQL query.
+Do not return conversational explanations.
+Do not return Markdown code fences (e.g. ```sql).
+Do not return <think> tags.
 
 If the user's question cannot be answered from the available schema, return:
 CANNOT_ANSWER
@@ -375,6 +236,8 @@ Rules for SQL generation:
    - For "What are my top products?": Group by product/item and order by revenue/sales or quantity sold DESC LIMIT 10.
    - For "Which category has the highest sales?": Group by category and order by revenue/sales DESC LIMIT 1.
    - For "What is my total revenue?": Calculate SUM of the available revenue or price column.
+   - For "Which region performs best?": Group by region and order by total sales/revenue DESC LIMIT 1.
+   - For "Compare categories": Group by category and aggregate total sales and transaction counts.
 6. STRICT PROFIT INTEGRITY RULES:
    - Profit calculation must be strictly data-driven, never assumption-driven.
    - NEVER invent, assume, infer, or calculate a default profit margin (e.g. NEVER assume 18%, 20%, or any arbitrary percentage).
@@ -437,6 +300,7 @@ def generate_insights(
     Analyzes query results to generate structured executive business insights:
     Executive Summary, Key Findings, Business Impact, and Actionable Recommendations.
     Strictly data-driven without assumed or hallucinated profit margins.
+    Uses Gemini as sole AI provider.
     """
     if user_margin is None:
         user_margin = extract_explicit_margin(question)
@@ -496,12 +360,13 @@ Instructions:
 
     try:
         response_text = call_llm(system_prompt, user_prompt, temperature=0.2)
+        response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
     except Exception as e:
         return {
             "summary": f"AI Insights could not be generated: {str(e)}",
-            "key_findings": ["Please check your LLM configuration or ensure the local model server is running."],
+            "key_findings": ["Please check your Gemini API configuration in .env."],
             "business_impact": "LLM inference error.",
-            "recommendations": ["Verify your LLM_PROVIDER and model settings in .env."]
+            "recommendations": ["Verify your GEMINI_API_KEY and GEMINI_MODEL settings in .env."]
         }
 
     # Parse the structured response
@@ -545,4 +410,3 @@ Instructions:
         "business_impact": business_impact,
         "recommendations": recommendations if recommendations else ["No specific recommendations parsed."]
     }
-

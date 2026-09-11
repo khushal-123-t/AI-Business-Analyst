@@ -12,7 +12,12 @@ pip-delete-this-directory.txt
 .uncommitted
 
 # Database
-database/*.db
+database/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # Environments
 .env

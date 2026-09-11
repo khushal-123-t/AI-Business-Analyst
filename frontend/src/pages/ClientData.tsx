@@ -23,6 +23,10 @@ export default function ClientData() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadLoading, setUploadLoading] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState(false);
+  const [uploadStage, setUploadStage] = useState<'idle' | 'uploading' | 'processing' | 'importing' | 'detecting' | 'ready'>('idle');
+  const [uploadPercent, setUploadPercent] = useState<number>(0);
+  const [uploadLoaded, setUploadLoaded] = useState<number>(0);
+  const [uploadTotal, setUploadTotal] = useState<number>(0);
 
   // File Input Ref for native file picker dialog and reset
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -188,9 +192,27 @@ export default function ClientData() {
     setUploadLoading(true);
     setUploadError(null);
     setUploadSuccess(false);
+    setUploadStage('uploading');
+    setUploadPercent(0);
+    setUploadLoaded(0);
+    setUploadTotal(selectedFile.size);
 
     try {
-      const newDs = await api.uploadDataset(datasetName.trim(), selectedFile);
+      const newDs = await api.uploadDataset(
+        datasetName.trim(), 
+        selectedFile,
+        (percent, loaded, total) => {
+          setUploadPercent(percent);
+          setUploadLoaded(loaded);
+          setUploadTotal(total);
+          if (percent >= 100) {
+            setUploadStage('processing');
+            setTimeout(() => setUploadStage((prev) => prev === 'processing' ? 'importing' : prev), 300);
+            setTimeout(() => setUploadStage((prev) => prev === 'importing' ? 'detecting' : prev), 800);
+          }
+        }
+      );
+      setUploadStage('ready');
       setUploadSuccess(true);
       
       // Auto set as active dataset
@@ -211,9 +233,11 @@ export default function ClientData() {
         setDatasetName('');
         setSelectedFile(null);
         setUploadSuccess(false);
+        setUploadStage('idle');
       }, 700);
     } catch (err: any) {
       setUploadError(err.message || 'Upload failed. Please verify format.');
+      setUploadStage('idle');
     } finally {
       setUploadLoading(false);
     }
@@ -595,6 +619,58 @@ export default function ClientData() {
                     </div>
                   </div>
 
+                  {uploadLoading && (
+                    <div className="p-4 bg-[#0d1220]/90 border border-indigo-500/25 rounded-xl space-y-2.5">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-semibold text-slate-200 flex items-center gap-2">
+                          <Loader2 className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
+                          {uploadStage === 'uploading' && `Uploading... ${uploadPercent}%`}
+                          {uploadStage === 'processing' && 'Processing dataset...'}
+                          {uploadStage === 'importing' && 'Importing data to database...'}
+                          {uploadStage === 'detecting' && 'Detecting schema...'}
+                          {uploadStage === 'ready' && 'Ready ✓'}
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-400">
+                          {uploadStage === 'uploading' 
+                            ? `${formatFileSize(uploadLoaded)} / ${formatFileSize(uploadTotal)}`
+                            : 'Optimized bulk insertion'}
+                        </span>
+                      </div>
+
+                      {/* Real Progress Bar */}
+                      <div className="w-full bg-slate-800/80 rounded-full h-2 overflow-hidden">
+                        <div 
+                          className="bg-gradient-to-r from-indigo-500 to-violet-500 h-2 rounded-full transition-all duration-200"
+                          style={{ 
+                            width: uploadStage === 'uploading' 
+                              ? `${Math.max(5, uploadPercent)}%` 
+                              : '100%' 
+                          }}
+                        />
+                      </div>
+
+                      {/* Stage steps indicator */}
+                      <div className="grid grid-cols-4 gap-1 text-[10px] pt-1">
+                        <div className={`flex items-center gap-1 ${uploadStage === 'uploading' ? 'text-indigo-400 font-bold' : 'text-emerald-400'}`}>
+                          <CheckCircle2 className="h-3 w-3" />
+                          <span>Uploading</span>
+                        </div>
+                        <div className={`flex items-center gap-1 ${uploadStage === 'uploading' ? 'text-slate-500' : uploadStage === 'processing' ? 'text-indigo-400 font-bold' : 'text-emerald-400'}`}>
+                          {uploadStage === 'uploading' ? <div className="h-2 w-2 rounded-full bg-slate-700" /> : <CheckCircle2 className="h-3 w-3" />}
+                          <span>Processing</span>
+                        </div>
+                        <div className={`flex items-center gap-1 ${['uploading', 'processing'].includes(uploadStage) ? 'text-slate-500' : uploadStage === 'importing' ? 'text-indigo-400 font-bold' : 'text-emerald-400'}`}>
+                          {['uploading', 'processing'].includes(uploadStage) ? <div className="h-2 w-2 rounded-full bg-slate-700" /> : <CheckCircle2 className="h-3 w-3" />}
+                          <span>Importing</span>
+                        </div>
+                        <div className={`flex items-center gap-1 ${uploadStage === 'ready' ? 'text-emerald-400' : uploadStage === 'detecting' ? 'text-indigo-400 font-bold' : 'text-slate-500'}`}>
+                          {uploadStage === 'ready' ? <CheckCircle2 className="h-3 w-3" /> : <div className="h-2 w-2 rounded-full bg-slate-700" />}
+                          <span>Schema</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="pt-4 flex justify-end gap-3 border-t border-slate-800/80">
                     <button
                       type="button"
@@ -612,7 +688,7 @@ export default function ClientData() {
                       {uploadLoading ? (
                         <>
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          Processing & Importing...
+                          {uploadStage === 'uploading' ? `Uploading (${uploadPercent}%)` : 'Importing Dataset...'}
                         </>
                       ) : (
                         <>

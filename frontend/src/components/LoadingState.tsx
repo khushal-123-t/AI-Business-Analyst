@@ -9,7 +9,7 @@ interface LoadingStage {
 
 const STAGES: LoadingStage[] = [
   { id: 0, label: 'Understanding your question', subLabel: 'Extracting categories, regions, and dates...' },
-  { id: 1, label: 'Generating SQLite query', subLabel: 'Asking Gemini to write optimized SQL...' },
+  { id: 1, label: 'Generating SQLite query', subLabel: 'Generating optimized SQL query...' },
   { id: 2, label: 'Running database analysis', subLabel: 'Executing SQL against sales warehouse...' },
   { id: 3, label: 'Creating visualization', subLabel: 'Auto-mapping fields to charts...' },
   { id: 4, label: 'Generating insights', subLabel: 'Synthesizing executive actions...' },
