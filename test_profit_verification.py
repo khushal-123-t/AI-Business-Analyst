@@ -38,7 +38,7 @@ def test_cases():
         mapping_a = resolve_columns(conn, "test_case_a")
         assert mapping_a["profit_available"] == True, "Case A profit should be available"
         assert mapping_a["profit_source"] == "column", f"Case A source should be column, got {mapping_a['profit_source']}"
-        assert mapping_a["profit"] == "`profit`", f"Case A mapped column should be `profit`, got {mapping_a['profit']}"
+        assert mapping_a["profit"] in ('"profit"', '`profit`'), f"Case A mapped column should be quoted profit, got {mapping_a['profit']}"
 
         dash_a = get_dashboard_data(conn, "test_case_a")
         assert dash_a["metrics"]["total_profit"] == 950.0, f"Expected 950.0, got {dash_a['metrics']['total_profit']}"

@@ -24,7 +24,7 @@ from sqlalchemy import inspect, text
 import pandas as pd
 
 from backend.config import settings
-from backend.database.connection import get_db, engine
+from backend.database.connection import get_db, engine, quote_ident
 from backend.database.init_db import create_and_seed_tables
 from backend.models.orm_models import Client, User, Dataset, Report
 from backend.utils.auth import (
@@ -237,9 +237,11 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     if "sales" in inspector.get_table_names():
         seed_table = f"dataset_client_{new_client.id}_seed"
         try:
-            db.execute(text(f"CREATE TABLE `{seed_table}` AS SELECT * FROM sales"))
+            quoted_seed = quote_ident(seed_table)
+            quoted_sales = quote_ident("sales")
+            db.execute(text(f"CREATE TABLE {quoted_seed} AS SELECT * FROM {quoted_sales}"))
             db.commit()
-            row_count = db.execute(text(f"SELECT COUNT(*) FROM `{seed_table}`")).scalar()
+            row_count = db.execute(text(f"SELECT COUNT(*) FROM {quoted_seed}")).scalar()
             col_count = len(inspector.get_columns("sales"))
             dataset = Dataset(
                 client_id=new_client.id,
@@ -387,10 +389,12 @@ def create_client(req: ClientCreate, db: Session = Depends(get_db), current_user
     inspector = inspect(engine)
     if "sales" in inspector.get_table_names():
         seed_table = f"dataset_client_{new_client.id}_seed"
-        db.execute(text(f"CREATE TABLE `{seed_table}` AS SELECT * FROM sales"))
+        quoted_seed = quote_ident(seed_table)
+        quoted_sales = quote_ident("sales")
+        db.execute(text(f"CREATE TABLE {quoted_seed} AS SELECT * FROM {quoted_sales}"))
         db.commit()
 
-        row_count = db.execute(text(f"SELECT COUNT(*) FROM `{seed_table}`")).scalar()
+        row_count = db.execute(text(f"SELECT COUNT(*) FROM {quoted_seed}")).scalar()
         col_count = len(inspector.get_columns("sales"))
 
         dataset = Dataset(
@@ -489,7 +493,8 @@ def delete_client(client_id: int, db: Session = Depends(get_db), current_user: U
     datasets = db.query(Dataset).filter(Dataset.client_id == client_id).all()
     for ds in datasets:
         try:
-            db.execute(text(f"DROP TABLE IF EXISTS `{ds.table_name}`"))
+            quoted_table = quote_ident(ds.table_name)
+            db.execute(text(f"DROP TABLE IF EXISTS {quoted_table}"))
         except Exception as e:
             print(f"Error dropping table {ds.table_name}: {str(e)}")
 
@@ -931,8 +936,9 @@ def import_client_library_dataset(
 
         chunk_size = getattr(settings, "CSV_CHUNK_SIZE", 10000)
         with engine.begin() as conn:
-            conn.execute(text("PRAGMA synchronous = NORMAL"))
-            conn.execute(text("PRAGMA journal_mode = WAL"))
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("PRAGMA synchronous = NORMAL"))
+                conn.execute(text("PRAGMA journal_mode = WAL"))
             df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=chunk_size)
 
         new_dataset = Dataset(
@@ -1039,8 +1045,9 @@ async def upload_client_dataset(
         t_insert_start = time.perf_counter()
         chunk_size = getattr(settings, "CSV_CHUNK_SIZE", 10000)
         with engine.begin() as conn:
-            conn.execute(text("PRAGMA synchronous = NORMAL"))
-            conn.execute(text("PRAGMA journal_mode = WAL"))
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("PRAGMA synchronous = NORMAL"))
+                conn.execute(text("PRAGMA journal_mode = WAL"))
             df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=chunk_size)
         t_insert = time.perf_counter() - t_insert_start
 
@@ -1117,9 +1124,10 @@ def delete_client_dataset(dataset_id: int, db: Session = Depends(get_db), curren
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found or unauthorized")
 
-    # Drop physical table from SQLite database
+    # Drop physical table from database
     try:
-        db.execute(text(f"DROP TABLE IF EXISTS `{dataset.table_name}`"))
+        quoted_table = quote_ident(dataset.table_name)
+        db.execute(text(f"DROP TABLE IF EXISTS {quoted_table}"))
         db.commit()
     except Exception as e:
         print(f"Failed to drop SQL table {dataset.table_name}: {str(e)}")
@@ -1227,7 +1235,8 @@ def get_schema_explorer_endpoint(dataset_id: Optional[int] = None, db: Session =
             })
 
         # Get preview rows safely
-        preview_res = db.execute(text(f"SELECT * FROM `{dataset.table_name}` LIMIT 10"))
+        quoted_table = quote_ident(dataset.table_name)
+        preview_res = db.execute(text(f"SELECT * FROM {quoted_table} LIMIT 10"))
         preview_cols = list(preview_res.keys())
         preview_rows = []
         for row in preview_res.fetchall():

@@ -22,7 +22,7 @@ for d in datasets:
     ds_id, client_id, name, table_name, row_count = d
     print(f"\nProcessing Dataset {ds_id}: '{name}' (Table: {table_name}, Rows: {row_count})")
     try:
-        df = pd.read_sql(f"SELECT * FROM `{table_name}`", engine)
+        df = pd.read_sql(f'SELECT * FROM "{table_name}"', engine)
         original_dtypes = df.dtypes.to_dict()
         df_cleaned = clean_dataframe_numeric_columns(df)
         

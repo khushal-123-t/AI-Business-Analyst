@@ -2,7 +2,7 @@ import time
 import os
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
-from backend.database.connection import engine
+from backend.database.connection import engine, quote_ident
 from backend.utils.sql_validator import is_safe_sql
 
 def get_db_schema() -> dict:
@@ -38,12 +38,13 @@ def get_schema_details(db: Session) -> list:
                 "type": str(column["type"])
             })
             
+        quoted_table = quote_ident(table_name)
         # Get row count
-        count_res = db.execute(text(f"SELECT COUNT(*) FROM `{table_name}`"))
+        count_res = db.execute(text(f"SELECT COUNT(*) FROM {quoted_table}"))
         row_count = count_res.scalar()
         
         # Get preview rows
-        preview_res = db.execute(text(f"SELECT * FROM `{table_name}` LIMIT 10"))
+        preview_res = db.execute(text(f"SELECT * FROM {quoted_table} LIMIT 10"))
         preview_cols = list(preview_res.keys())
         preview_rows = []
         for row in preview_res.fetchall():

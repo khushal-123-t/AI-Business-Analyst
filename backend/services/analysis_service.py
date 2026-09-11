@@ -1,6 +1,7 @@
 import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import text, inspect
+from backend.database.connection import quote_ident
 
 def analyze_result_set(columns: list, rows: list) -> dict:
     """
@@ -66,18 +67,19 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
         col_type_map = {c["name"]: str(c["type"]).upper() for c in col_objs}
     except Exception:
         return {
-            "revenue": "`revenue`", "profit": "`profit`", "order_id": "`order_id`",
-            "customer_id": "`customer_id`", "customer_name": "`customer_name`",
-            "category": "`category`", "region": "`region`", "order_date": "`order_date`",
+            "revenue": quote_ident("revenue"), "profit": quote_ident("profit"), "order_id": quote_ident("order_id"),
+            "customer_id": quote_ident("customer_id"), "customer_name": quote_ident("customer_name"),
+            "category": quote_ident("category"), "region": quote_ident("region"), "order_date": quote_ident("order_date"),
             "profit_available": True, "profit_source": "default"
         }
 
     NUMERIC_TYPES = ("FLOAT", "REAL", "INT", "DOUBLE", "DECIMAL", "NUMERIC")
     def safe_col_expr(col_name: str) -> str:
         ctype = col_type_map.get(col_name, "").upper()
+        quoted = quote_ident(col_name)
         if any(t in ctype for t in NUMERIC_TYPES):
-            return f"`{col_name}`"
-        return clean_numeric_sql(f"`{col_name}`")
+            return quoted
+        return clean_numeric_sql(quoted)
 
     import re
 
@@ -203,7 +205,7 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
         final_mapping["profit_source"] = "margin_column"
         final_mapping["margin_col"] = margin_col
         final_mapping["profit_available"] = True
-        final_mapping["profit_note"] = f"Calculated using dataset margin column `{margin_col}`"
+        final_mapping["profit_note"] = f"Calculated using dataset margin column '{margin_col}'"
     elif user_margin is not None and final_mapping.get("revenue") and final_mapping["revenue"] != "0":
         margin_mult = user_margin / 100.0 if user_margin > 1.0 else user_margin
         final_mapping["profit"] = f"({final_mapping['revenue']} * {margin_mult})"
@@ -221,50 +223,50 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
     # 3. Order ID & Aggregates
     if summary_orders_col and summary_orders_col in columns:
         final_mapping["orders_aggregate"] = f"SUM({safe_col_expr(summary_orders_col)})"
+        final_mapping["order_id"] = "1"
+    elif order_col and order_col in columns:
+        final_mapping["order_id"] = quote_ident(order_col)
+        final_mapping["orders_aggregate"] = f"COUNT(DISTINCT {quote_ident(order_col)})"
     else:
-        final_mapping["orders_aggregate"] = None
-
-    if order_col and order_col in columns:
-        final_mapping["order_id"] = f"`{order_col}`"
-    else:
-        final_mapping["order_id"] = "ROWID"
+        final_mapping["order_id"] = "1"
+        final_mapping["orders_aggregate"] = "COUNT(*)"
 
     # 4. Customer ID & Aggregates
     if summary_cust_col and summary_cust_col in columns:
         final_mapping["customers_aggregate"] = f"SUM({safe_col_expr(summary_cust_col)})"
+        final_mapping["customer_id"] = "1"
+    elif cust_id_col and cust_id_col in columns:
+        final_mapping["customer_id"] = quote_ident(cust_id_col)
+        final_mapping["customers_aggregate"] = f"COUNT(DISTINCT {quote_ident(cust_id_col)})"
     else:
-        final_mapping["customers_aggregate"] = None
-
-    if cust_id_col and cust_id_col in columns:
-        final_mapping["customer_id"] = f"`{cust_id_col}`"
-    else:
-        final_mapping["customer_id"] = "ROWID"
+        final_mapping["customer_id"] = "1"
+        final_mapping["customers_aggregate"] = "COUNT(*)"
 
     final_mapping["aov_col"] = aov_col if aov_col and aov_col in columns else None
 
     # 5. Customer Name
     if cust_name_col and cust_name_col in columns:
-        final_mapping["customer_name"] = f"`{cust_name_col}`"
+        final_mapping["customer_name"] = quote_ident(cust_name_col)
     elif summary_orders_col and summary_orders_col in columns:
         final_mapping["customer_name"] = "'Dataset Summary'"
     else:
-        final_mapping["customer_name"] = "('Item ' || ROWID)"
+        final_mapping["customer_name"] = "'Item'"
 
     # 6. Category
     if cat_col and cat_col in columns:
-        final_mapping["category"] = f"`{cat_col}`"
+        final_mapping["category"] = quote_ident(cat_col)
     else:
         final_mapping["category"] = "'General'"
 
     # 7. Region
     if reg_col and reg_col in columns:
-        final_mapping["region"] = f"`{reg_col}`"
+        final_mapping["region"] = quote_ident(reg_col)
     else:
         final_mapping["region"] = "'Global'"
 
     # 8. Date
     if date_col and date_col in columns:
-        final_mapping["order_date"] = f"`{date_col}`"
+        final_mapping["order_date"] = quote_ident(date_col)
     else:
         final_mapping["order_date"] = "CURRENT_DATE"
 
@@ -296,6 +298,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     if cache_key in _dashboard_cache:
         return _dashboard_cache[cache_key]
 
+    quoted_table = quote_ident(table_name)
     cols = resolve_columns(db, table_name, user_margin=user_margin)
 
     # 1. Fetch KPI metrics (Single fast aggregated query)
@@ -309,7 +312,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
             COALESCE(SUM({cols['profit']}), 0) AS total_profit,
             COALESCE({orders_expr}, 0) AS total_orders,
             COALESCE({customers_expr}, 0) AS total_customers
-        FROM `{table_name}`
+        FROM {quoted_table}
         """
         kpi_res = db.execute(text(kpi_query)).fetchone()
         total_revenue = float(kpi_res[0]) if kpi_res and kpi_res[0] is not None else 0.0
@@ -322,7 +325,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
             COALESCE(SUM({cols['revenue']}), 0) AS total_revenue,
             COALESCE({orders_expr}, 0) AS total_orders,
             COALESCE({customers_expr}, 0) AS total_customers
-        FROM `{table_name}`
+        FROM {quoted_table}
         """
         kpi_res = db.execute(text(kpi_query)).fetchone()
         total_revenue = float(kpi_res[0]) if kpi_res and kpi_res[0] is not None else 0.0
@@ -334,7 +337,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
         average_order_value = total_revenue / total_orders
     elif cols.get("aov_col"):
         aov_col_name = cols["aov_col"]
-        aov_q = f"SELECT COALESCE(AVG({clean_numeric_sql('`' + aov_col_name + '`')}), 0) FROM `{table_name}`"
+        aov_q = f"SELECT COALESCE(AVG({clean_numeric_sql(quote_ident(aov_col_name))}), 0) FROM {quoted_table}"
         aov_row = db.execute(text(aov_q)).fetchone()
         average_order_value = float(aov_row[0]) if aov_row and aov_row[0] is not None else 0.0
     else:
@@ -349,7 +352,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
             SUBSTR(TRIM({cols['order_date']}), 1, 7) AS month,
             COALESCE(SUM({cols['revenue']}), 0) AS revenue,
             COALESCE({orders_expr}, 0) AS orders
-        FROM `{table_name}`
+        FROM {quoted_table}
         WHERE {cols['order_date']} IS NOT NULL AND TRIM({cols['order_date']}) != ''
         GROUP BY month
         ORDER BY month ASC
@@ -365,7 +368,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
                 revenue_trend.append({"month": str(r[0]), "revenue": round(float(r[1]), 2)})
                 monthly_orders.append({"month": str(r[0]), "orders": int(r[2])})
         else:
-            raw_trend_query = f"SELECT {cols['order_date']} AS raw_date, {cols['revenue']} AS revenue, {cols['order_id']} AS order_id FROM `{table_name}`"
+            raw_trend_query = f"SELECT {cols['order_date']} AS raw_date, {cols['revenue']} AS revenue, {cols['order_id']} AS order_id FROM {quoted_table}"
             df_trend = pd.read_sql(raw_trend_query, db.bind)
             if not df_trend.empty:
                 df_trend["revenue"] = pd.to_numeric(df_trend["revenue"], errors="coerce").fillna(0)
@@ -390,7 +393,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
         SELECT
             {cols['category']} AS raw_category,
             COALESCE(SUM({cols['revenue']}), 0) AS revenue
-        FROM `{table_name}`
+        FROM {quoted_table}
         GROUP BY {cols['category']}
         ORDER BY revenue DESC
         LIMIT 40
@@ -410,7 +413,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
             SELECT
                 {cols['category']} AS raw_category,
                 COALESCE(SUM({cols['profit']}), 0) AS profit
-            FROM `{table_name}`
+            FROM {quoted_table}
             GROUP BY {cols['category']}
             ORDER BY profit DESC
             LIMIT 40
@@ -436,7 +439,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
         SELECT
             COALESCE(NULLIF(TRIM({cols['region']}), ''), 'Global') AS region,
             COALESCE(SUM({cols['revenue']}), 0) AS revenue
-        FROM `{table_name}`
+        FROM {quoted_table}
         GROUP BY region
         ORDER BY revenue DESC
         LIMIT 8
@@ -455,7 +458,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
                 COALESCE(NULLIF(TRIM({cols['customer_name']}), ''), 'Item') AS customer_name,
                 COALESCE(SUM({cols['revenue']}), 0) AS revenue,
                 COALESCE(SUM({cols['profit']}), 0) AS profit
-            FROM `{table_name}`
+            FROM {quoted_table}
             GROUP BY customer_name
             ORDER BY revenue DESC
             LIMIT 10
@@ -474,7 +477,7 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
             SELECT
                 COALESCE(NULLIF(TRIM({cols['customer_name']}), ''), 'Item') AS customer_name,
                 COALESCE(SUM({cols['revenue']}), 0) AS revenue
-            FROM `{table_name}`
+            FROM {quoted_table}
             GROUP BY customer_name
             ORDER BY revenue DESC
             LIMIT 10

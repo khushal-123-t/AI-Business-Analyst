@@ -4,6 +4,7 @@ import json
 from typing import List, Dict, Any, Optional
 
 from backend.config import settings
+from backend.database.connection import quote_ident
 from backend.services.sql_service import get_db_schema
 from backend.utils.sql_validator import is_safe_sql
 from backend.services.llm_provider import (
@@ -274,8 +275,9 @@ Previous context:
 
         # If a custom table was specified and model erroneously referenced 'sales', sanitize it
         if table_name and table_name.lower() != "sales":
-            sql = re.sub(r"\bFROM\s+sales\b", f"FROM `{table_name}`", sql, flags=re.IGNORECASE)
-            sql = re.sub(r"\bJOIN\s+sales\b", f"JOIN `{table_name}`", sql, flags=re.IGNORECASE)
+            quoted_t = quote_ident(table_name)
+            sql = re.sub(r"\bFROM\s+sales\b", f"FROM {quoted_t}", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"\bJOIN\s+sales\b", f"JOIN {quoted_t}", sql, flags=re.IGNORECASE)
 
         # Validate the generated SQL
         is_safe, err_msg = is_safe_sql(sql)

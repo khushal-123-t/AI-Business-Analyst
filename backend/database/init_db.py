@@ -6,7 +6,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 import pandas as pd
 
-from backend.database.connection import engine, Base, SessionLocal, PROJECT_ROOT
+from backend.database.connection import engine, Base, SessionLocal, PROJECT_ROOT, quote_ident
 from backend.models.orm_models import Client, User, Dataset, Report
 from backend.utils.auth import get_password_hash
 
@@ -146,10 +146,12 @@ def create_and_seed_tables():
             c1_table = f"dataset_client_{client1.id}_seed"
             if c1_table not in table_names:
                 logger.info(f"[Database Init] Creating isolated seed dataset {c1_table} from sales...")
-                db.execute(text(f"CREATE TABLE `{c1_table}` AS SELECT * FROM sales"))
+                quoted_c1 = quote_ident(c1_table)
+                quoted_sales = quote_ident("sales")
+                db.execute(text(f"CREATE TABLE {quoted_c1} AS SELECT * FROM {quoted_sales}"))
                 db.commit()
                 
-                row_count = db.execute(text(f"SELECT COUNT(*) FROM `{c1_table}`")).scalar()
+                row_count = db.execute(text(f"SELECT COUNT(*) FROM {quoted_c1}")).scalar()
                 cols = inspector.get_columns("sales")
                 col_count = len(cols)
                 
@@ -172,10 +174,12 @@ def create_and_seed_tables():
             c2_table = f"dataset_client_{client2.id}_seed"
             if c2_table not in table_names:
                 logger.info(f"[Database Init] Creating isolated seed dataset {c2_table} from sales...")
-                db.execute(text(f"CREATE TABLE `{c2_table}` AS SELECT * FROM sales"))
+                quoted_c2 = quote_ident(c2_table)
+                quoted_sales = quote_ident("sales")
+                db.execute(text(f"CREATE TABLE {quoted_c2} AS SELECT * FROM {quoted_sales}"))
                 db.commit()
                 
-                row_count = db.execute(text(f"SELECT COUNT(*) FROM `{c2_table}`")).scalar()
+                row_count = db.execute(text(f"SELECT COUNT(*) FROM {quoted_c2}")).scalar()
                 cols = inspector.get_columns("sales")
                 col_count = len(cols)
                 

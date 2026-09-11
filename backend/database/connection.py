@@ -105,6 +105,23 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+def quote_ident(name: str) -> str:
+    """
+    Safely quotes an SQL table or column identifier for the active database engine
+    (PostgreSQL or SQLite), replacing MySQL/SQLite-only backticks (`).
+    Uses SQLAlchemy's dialect-specific identifier preparer or ANSI standard double quotes.
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Invalid SQL identifier: {name}")
+    # Strip any preexisting quotes, backticks, and whitespace
+    clean = name.strip("`\"' ")
+    try:
+        return engine.dialect.identifier_preparer.quote_identifier(clean)
+    except Exception:
+        escaped = clean.replace('"', '""')
+        return f'"{escaped}"'
+
+
 def get_db():
     """FastAPI dependency that yields a SQLAlchemy database session."""
     db = SessionLocal()
@@ -112,3 +129,4 @@ def get_db():
         yield db
     finally:
         db.close()
+
