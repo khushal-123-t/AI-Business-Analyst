@@ -43,10 +43,12 @@ export default function SignUp() {
 
     setLoading(true);
 
+    const cleanEmail = email.trim().toLowerCase();
+
     try {
-      await api.register(fullName.trim(), email.trim(), password);
-      // Seamless redirect to login with success indicator
-      navigate('/login?registered=1', { state: { email: email.trim() } });
+      await api.register(fullName.trim(), cleanEmail, password);
+      // Seamless redirect to login with success indicator and pre-filled normalized email
+      navigate('/login?registered=1', { state: { email: cleanEmail } });
     } catch (err: any) {
       setError(err.message || 'Registration failed. Please try again.');
     } finally {

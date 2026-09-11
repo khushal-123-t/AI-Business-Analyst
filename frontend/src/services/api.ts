@@ -4,7 +4,7 @@ import type {
   LibraryDataset
 } from '../types';
 
-const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+const API_URL = (import.meta.env.VITE_API_URL || 'https://ai-business-analyst-20jn.onrender.com').replace(/\/+$/, '');
 
 function handleAuthExpiry() {
   localStorage.removeItem('token');
@@ -47,10 +47,11 @@ async function handleResponse<T>(response: Response): Promise<T> {
 export const api = {
   // --- AUTHENTICATION ---
   async login(email: string, password: string): Promise<{ access_token: string; role: string; name: string }> {
+    const cleanEmail = email.trim().toLowerCase();
     const res = await fetch(`${API_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
+      body: JSON.stringify({ email: cleanEmail, password })
     });
     const data = await handleResponse<{ access_token: string; token_type: string; role: string; name: string }>(res);
     localStorage.setItem('token', data.access_token);
@@ -60,10 +61,11 @@ export const api = {
   },
 
   async register(fullName: string, email: string, password: string, companyName?: string): Promise<{ access_token: string; role: string; name: string }> {
+    const cleanEmail = email.trim().toLowerCase();
     const res = await fetch(`${API_URL}/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ full_name: fullName, email, password, company_name: companyName })
+      body: JSON.stringify({ full_name: fullName.trim(), email: cleanEmail, password, company_name: companyName })
     });
     const data = await handleResponse<{ access_token: string; token_type: string; role: string; name: string }>(res);
     return { access_token: data.access_token, role: data.role, name: data.name };

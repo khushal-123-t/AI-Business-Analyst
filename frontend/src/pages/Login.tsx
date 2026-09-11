@@ -1,14 +1,15 @@
 import React, { useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { Eye, EyeOff, Lock, Mail, TrendingUp, Loader2 } from 'lucide-react';
 import { api } from '../services/api';
 
 export default function Login() {
   const [searchParams] = useSearchParams();
+  const location = useLocation();
   const isExpired = searchParams.get('expired') === '1' || searchParams.get('session_expired') === '1';
   const isRegistered = searchParams.get('registered') === '1';
 
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState((location.state as any)?.email || '');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -18,7 +19,8 @@ export default function Login() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email.trim() || !password.trim()) {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !password.trim()) {
       setError('Please fill in all fields');
       return;
     }
@@ -27,7 +29,7 @@ export default function Login() {
     setError(null);
 
     try {
-      const data = await api.login(email.trim(), password);
+      const data = await api.login(cleanEmail, password);
       if (data.role === 'ADMIN') {
         navigate('/admin/dashboard');
       } else {
