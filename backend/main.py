@@ -47,9 +47,11 @@ from backend.services.sql_service import execute_query
 from backend.services.llm_provider import provider_manager
 from backend.services.llm_service import (
     generate_sql, generate_insights, add_history_context, extract_explicit_margin,
+    execute_query_with_retry,
     LLMError, LLMConnectionError, LLMAuthError, LLMModelError, LLMEmptyResponse,
     SQLExtractionError, SQLValidationError, CannotAnswerError
 )
+from backend.services.schema_service import inspect_dataset_schema
 from backend.services.analysis_service import get_dashboard_data, resolve_columns, invalidate_dashboard_cache
 from backend.services.visualization_service import determine_chart_config
 
@@ -728,14 +730,23 @@ def parse_uploaded_file_to_df(filename: str, contents: bytes) -> pd.DataFrame:
     )
 
 def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanitizes column names to be valid, clean, and unique SQLite column identifiers."""
+    """Sanitizes column names to be valid, clean, and unique SQL column identifiers for PostgreSQL and SQLite."""
+    SQL_RESERVED_WORDS = {
+        "order", "user", "group", "table", "select", "from", "where", "limit",
+        "check", "column", "primary", "foreign", "key", "index", "default",
+        "grant", "revoke", "window", "all", "and", "or", "not", "in", "like",
+        "case", "when", "then", "else", "end", "offset", "join", "on"
+    }
+
     clean_cols = []
     for i, col in enumerate(df.columns):
-        col_str = str(col).strip()
-        cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', col_str)
+        col_str = str(col).strip().lower()
+        cleaned = re.sub(r'[^a-z0-9_]', '_', col_str)
         cleaned = re.sub(r'_+', '_', cleaned).strip('_')
         if not cleaned:
             cleaned = f"col_{i+1}"
+        elif cleaned in SQL_RESERVED_WORDS:
+            cleaned = f"{cleaned}_col"
         clean_cols.append(cleaned)
 
     # Ensure uniqueness
@@ -1333,15 +1344,11 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
         dataset = None
         target_table = "sales"
 
-    # 2. Get table column details for custom schema formatting
+    # 2. Get table column details and sample data using dynamic schema profiling
     try:
-        inspector = inspect(engine)
-        cols_info = []
-        for column in inspector.get_columns(target_table):
-            cols_info.append({
-                "name": column["name"],
-                "type": str(column["type"])
-            })
+        schema_info = inspect_dataset_schema(db, target_table)
+        cols_info = [{"name": c, "type": schema_info["column_types"].get(c, "VARCHAR")} for c in schema_info["columns"]]
+        sample_rows = schema_info.get("sample_rows", [])
     except Exception as e:
         logger.error(f"[/api/ask] Failed to inspect target schema for `{target_table}`: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to inspect target schema: {str(e)}")
@@ -1351,8 +1358,8 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
     user_margin = extract_explicit_margin(question)
 
     # Check if target table schema has profit/margin columns or user provided margin
-    profit_col = next((c["name"] for c in cols_info if c["name"].lower() in ["profit", "net_profit", "gross_profit", "profit_amount", "total_profit", "earnings"]), None)
-    margin_col = next((c["name"] for c in cols_info if c["name"].lower() in ["profit_margin", "profit_margin_percent", "margin_percent", "margin_percentage", "margin"]), None)
+    profit_col = schema_info.get("profit_col")
+    margin_col = schema_info.get("margin_col")
     has_profit_data = (profit_col is not None) or (margin_col is not None) or (user_margin is not None)
 
     # If the user specifically asks about profit/profitability but no profit data or margin is available:
@@ -1377,16 +1384,19 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
         )
 
     try:
-        # 3. Generate SQL via LLM service restricted to the target table schema
+        # 3. Generate and execute SQL with automatic self-correction retry loop
         try:
-            sql = generate_sql(
-                question, 
-                session_id=session_id, 
-                table_name=target_table, 
+            sql, columns, rows = execute_query_with_retry(
+                question=question,
+                table_name=target_table,
                 columns=cols_info,
-                user_margin=user_margin
+                db=db,
+                session_id=session_id,
+                user_margin=user_margin,
+                sample_rows=sample_rows,
+                max_correction_retries=2
             )
-            logger.info(f"[/api/ask] Generated SQL:\n{sql}")
+            logger.info(f"[/api/ask] Query generated and executed successfully: {len(rows)} rows returned.")
         except CannotAnswerError as e:
             logger.warning(f"[/api/ask] Question cannot be answered with current schema: {str(e)}")
             col_names = [c["name"] for c in cols_info]
@@ -1442,19 +1452,18 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
                 success=False, error=f"SQL_VALIDATION_ERROR: {str(e)}"
             )
         except Exception as e:
-            logger.error(f"[/api/ask] Unexpected SQL Generation Error: {str(e)}")
+            logger.error(f"[/api/ask] SQL Execution / Database Error: {str(e)}")
             return AskResponse(
                 question=question, sql="", columns=[], rows=[],
                 chart=ChartConfig(chart_type="none", data=[]),
-                summary="Sorry, I encountered an issue generating an SQL query for this question.",
-                key_findings=[f"Detail: {str(e)}"],
-                business_impact="Unable to parse question context.",
-                recommendations=["Try rephrasing your question.", "Verify database fields in the Data Explorer."],
-                success=False, error=f"SQL_GENERATION_ERROR: {str(e)}"
+                summary="The AI analyst encountered an error querying the dataset.",
+                key_findings=[f"Details: {str(e).splitlines()[0]}"],
+                business_impact="Database query execution unsuccessful after retries.",
+                recommendations=["Try rephrasing the question using available column names.", "Verify table fields in the Data Explorer."],
+                success=False, error=f"SQL_EXECUTION_ERROR: {str(e)}"
             )
 
         # 4. Strict Security Verification: Enforce Table Isolation
-        # Verify the generated SQL does NOT reference any other table than target_table
         if not verify_sql_isolation(sql, target_table):
             logger.warning(f"[/api/ask] Security Block: Query attempted cross-table access outside of `{target_table}`.")
             return AskResponse(
@@ -1465,22 +1474,6 @@ def ask_analyst_endpoint(request: AskRequest, dataset_id: Optional[int] = None, 
                 business_impact="Data isolation policy violation block.",
                 recommendations=["Please rephrase your question to target only your active dataset columns."],
                 success=False, error="SECURITY_ISOLATION_ERROR: Cross-table access disallowed."
-            )
-
-        # 5. Execute query (handles safety and limit appending)
-        try:
-            columns, rows = execute_query(sql, db)
-            logger.info(f"[/api/ask] Query executed successfully: {len(rows)} rows returned.")
-        except Exception as e:
-            logger.error(f"[/api/ask] Database Execution Error: {str(e)}")
-            return AskResponse(
-                question=question, sql=sql, columns=[], rows=[],
-                chart=ChartConfig(chart_type="none", data=[]),
-                summary="The query generated by the AI analyst encountered a database error.",
-                key_findings=["This usually happens if the generated SQL syntax is invalid or references missing columns."],
-                business_impact="SQL Execution blocked or failed.",
-                recommendations=["Try rephrasing the question.", "Verify database fields in the Data Explorer."],
-                success=False, error=f"SQL_EXECUTION_ERROR: {str(e)}"
             )
 
         # 6. Determine visualization chart configuration

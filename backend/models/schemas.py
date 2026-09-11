@@ -39,6 +39,7 @@ class DashboardMetrics(BaseModel):
     profit_available: bool = True
     profit_source: Optional[str] = None
     profit_note: Optional[str] = None
+    metric_labels: Optional[Dict[str, str]] = None
 
 class DashboardResponse(BaseModel):
     metrics: DashboardMetrics
@@ -49,6 +50,8 @@ class DashboardResponse(BaseModel):
     top_customers: List[Dict[str, Any]]
     monthly_orders: List[Dict[str, Any]]
     profit_available: bool = True
+    skipped_visualizations: List[str] = []
+    metric_labels: Optional[Dict[str, str]] = None
 
 # --- Data Explorer /api/schema models ---
 

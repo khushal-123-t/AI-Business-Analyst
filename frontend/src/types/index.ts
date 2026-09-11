@@ -33,6 +33,13 @@ export interface DashboardMetrics {
   total_orders: number;
   total_customers: number;
   average_order_value: number;
+  metric_labels?: {
+    primary_metric_title?: string;
+    count_title?: string;
+    average_title?: string;
+    category_title?: string;
+    region_title?: string;
+  };
 }
 
 export interface DashboardResponse {
@@ -44,6 +51,14 @@ export interface DashboardResponse {
   profit_available?: boolean;
   top_customers: Record<string, any>[];
   monthly_orders: Record<string, any>[];
+  skipped_visualizations?: string[];
+  metric_labels?: {
+    primary_metric_title?: string;
+    count_title?: string;
+    average_title?: string;
+    category_title?: string;
+    region_title?: string;
+  };
 }
 
 export interface ColumnInfo {

@@ -68,10 +68,21 @@ export default function Dashboard() {
 
   return (
     <div className="p-8 space-y-8 overflow-y-auto h-[calc(100vh-80px)]">
+      {/* Skipped Visualizations Notice if any */}
+      {data.skipped_visualizations && data.skipped_visualizations.length > 0 && (
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl px-4 py-3 flex items-start gap-3 text-xs text-slate-400">
+          <AlertCircle className="h-4 w-4 text-amber-400/80 shrink-0 mt-0.5" />
+          <div>
+            <span className="font-semibold text-slate-200">Dataset Adaptation Notice: </span>
+            {data.skipped_visualizations.join(" ")}
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
         <KPICard
-          title="Total Revenue"
+          title={metrics.metric_labels?.primary_metric_title || "Total Revenue"}
           value={formatCurrency(metrics.total_revenue)}
           icon={DollarSign}
           description="Gross warehouse value"
@@ -89,7 +100,7 @@ export default function Dashboard() {
           color="emerald"
         />
         <KPICard
-          title="Total Orders"
+          title={metrics.metric_labels?.count_title || "Total Orders"}
           value={metrics.total_orders.toLocaleString()}
           icon={ShoppingCart}
           description="Fulfillments processed"
@@ -103,7 +114,7 @@ export default function Dashboard() {
           color="amber"
         />
         <KPICard
-          title="Average Order Value"
+          title={metrics.metric_labels?.average_title || "Average Order Value"}
           value={formatCurrency(metrics.average_order_value)}
           icon={Percent}
           description="Mean gross transaction"

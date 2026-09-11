@@ -208,13 +208,24 @@ export default function ClientAnalytics() {
         </div>
       </div>
 
+      {/* Skipped Visualizations Notice if any */}
+      {data.skipped_visualizations && data.skipped_visualizations.length > 0 && (
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl px-4 py-3 flex items-start gap-3 text-xs text-slate-400">
+          <AlertCircle className="h-4 w-4 text-amber-400/80 shrink-0 mt-0.5" />
+          <div>
+            <span className="font-semibold text-slate-200">Dataset Adaptation Notice: </span>
+            {data.skipped_visualizations.join(" ")}
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
         <KPICard
-          title="Total Revenue"
+          title={metrics.metric_labels?.primary_metric_title || "Total Revenue"}
           value={formatCurrency(metrics.total_revenue)}
           icon={DollarSign}
-          description="Gross warehouse value"
+          description="Primary aggregated metric"
           color="indigo"
         />
         <KPICard
@@ -229,24 +240,24 @@ export default function ClientAnalytics() {
           color="emerald"
         />
         <KPICard
-          title="Total Orders"
+          title={metrics.metric_labels?.count_title || "Total Orders"}
           value={metrics.total_orders.toLocaleString()}
           icon={ShoppingCart}
-          description="Fulfillments processed"
+          description="Recorded transactions / items"
           color="sky"
         />
         <KPICard
-          title="Total Customers"
+          title="Total Entities"
           value={metrics.total_customers.toLocaleString()}
           icon={Users}
-          description="Unique buyers segment"
+          description="Unique distinct identifiers"
           color="amber"
         />
         <KPICard
-          title="Average Order Value"
+          title={metrics.metric_labels?.average_title || "Average Order Value"}
           value={formatCurrency(metrics.average_order_value)}
           icon={Percent}
-          description="Mean transaction value"
+          description="Mean metric per record"
           color="rose"
         />
       </div>
@@ -256,8 +267,10 @@ export default function ClientAnalytics() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <div className="glass-panel p-6 rounded-xl border border-slate-800">
             <div className="mb-4">
-              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Revenue Trend</h3>
-              <span className="text-[10px] text-slate-500 font-medium">Monthly revenue totals</span>
+              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">
+                {metrics.metric_labels?.primary_metric_title ? `${metrics.metric_labels.primary_metric_title.replace('Total ', '')} Trend` : "Monthly Trend"}
+              </h3>
+              <span className="text-[10px] text-slate-500 font-medium">Periodic metric totals</span>
             </div>
             <ChartsWrapper
               chartType="line"
@@ -270,8 +283,10 @@ export default function ClientAnalytics() {
 
           <div className="glass-panel p-6 rounded-xl border border-slate-800">
             <div className="mb-4">
-              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Monthly Order Volume</h3>
-              <span className="text-[10px] text-slate-500 font-medium">Unique transactions count per month</span>
+              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">
+                Monthly Record Volume
+              </h3>
+              <span className="text-[10px] text-slate-500 font-medium">Transactions or items count per month</span>
             </div>
             <ChartsWrapper
               chartType="bar"
@@ -289,8 +304,10 @@ export default function ClientAnalytics() {
         <div className={`grid grid-cols-1 ${data.profit_by_category && data.profit_by_category.length > 0 ? "lg:grid-cols-3" : "lg:grid-cols-2"} gap-8`}>
           <div className="glass-panel p-6 rounded-xl border border-slate-800">
             <div className="mb-4">
-              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Revenue by Category</h3>
-              <span className="text-[10px] text-slate-500 font-medium">Proportional category share</span>
+              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">
+                {metrics.metric_labels?.category_title || "Distribution by Category"}
+              </h3>
+              <span className="text-[10px] text-slate-500 font-medium">Proportional dimension share</span>
             </div>
             <ChartsWrapper
               chartType="donut"
@@ -317,29 +334,33 @@ export default function ClientAnalytics() {
             </div>
           )}
 
-          <div className="glass-panel p-6 rounded-xl border border-slate-800">
-            <div className="mb-4">
-              <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">Revenue by Region</h3>
-              <span className="text-[10px] text-slate-500 font-medium">Regional sales distribution</span>
+          {data.revenue_by_region.length > 0 && (
+            <div className="glass-panel p-6 rounded-xl border border-slate-800">
+              <div className="mb-4">
+                <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase">
+                  {metrics.metric_labels?.region_title || "Secondary Distribution"}
+                </h3>
+                <span className="text-[10px] text-slate-500 font-medium">Regional / location distribution</span>
+              </div>
+              <ChartsWrapper
+                chartType="bar"
+                xAxis="region"
+                yAxis="revenue"
+                data={data.revenue_by_region}
+                height={260}
+              />
             </div>
-            <ChartsWrapper
-              chartType="bar"
-              xAxis="region"
-              yAxis="revenue"
-              data={data.revenue_by_region}
-              height={260}
-            />
-          </div>
+          )}
         </div>
       )}
 
-      {/* Top 10 Customers */}
+      {/* Top 10 Customers / Entities */}
       {data.top_customers.length > 0 && (
         <div className="grid grid-cols-1 gap-8">
           <DataTable
             columns={metrics.total_profit !== null ? ['customer_name', 'revenue', 'profit'] : ['customer_name', 'revenue']}
             rows={data.top_customers}
-            title="Top 10 Customers by Revenue"
+            title={metrics.metric_labels?.primary_metric_title ? `Top 10 Entities by ${metrics.metric_labels.primary_metric_title.replace('Total ', '')}` : "Top 10 Items"}
             pageSize={5}
           />
         </div>

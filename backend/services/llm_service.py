@@ -144,46 +144,115 @@ def extract_explicit_margin(text: str) -> Optional[float]:
     return None
 
 
+from backend.database.connection import quote_ident, engine
+from backend.services.sql_service import get_db_schema, execute_query
+
+def get_db_dialect() -> str:
+    """Returns 'postgresql' or 'sqlite' depending on the active database engine."""
+    try:
+        return engine.dialect.name.lower()
+    except Exception:
+        return "sqlite"
+
+def sanitize_db_error_message(err_msg: str) -> str:
+    """Removes sensitive database connection strings, passwords, or internal URLs from error messages."""
+    if not err_msg:
+        return "Unknown database error"
+    sanitized = re.sub(r":\/\/[^:]+:[^@]+@", "://***:***@", str(err_msg))
+    sanitized = re.sub(r"password=([^\s]+)", "password=***", sanitized)
+    return sanitized
+
+def validate_referenced_columns(sql: str, available_columns: list) -> tuple[bool, str]:
+    """
+    Validates that SQL doesn't invent non-existent column names.
+    Ignores SQL keywords, aliases, numbers, and functions.
+    """
+    if not available_columns:
+        return True, ""
+    
+    col_names = [c["name"] if isinstance(c, dict) else str(c) for c in available_columns]
+    col_names_lower = {c.lower() for c in col_names}
+    
+    # Common SQL keywords, clauses, functions, and standard types to exclude
+    SQL_RESERVED = {
+        "select", "from", "where", "group", "by", "order", "desc", "asc", "as",
+        "and", "or", "not", "in", "like", "ilike", "between", "case", "when", "then",
+        "else", "end", "sum", "avg", "count", "min", "max", "coalesce", "nullif",
+        "round", "cast", "substr", "trim", "to_char", "date_trunc", "extract",
+        "limit", "offset", "distinct", "join", "inner", "left", "right", "outer",
+        "on", "with", "union", "all", "true", "false", "null", "is", "text", "numeric",
+        "real", "int", "integer", "float", "timestamp", "date", "time", "double",
+        "precision", "having", "exists", "interval", "over", "partition"
+    }
+
+    # Extract words that could be column references (alphanumeric snake_case tokens)
+    tokens = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", sql)
+    for token in tokens:
+        t_lower = token.lower()
+        # If token ends with _col or is reserved or in available columns, it's valid
+        if t_lower in SQL_RESERVED or t_lower.isdigit():
+            continue
+        # If it's a known column, it's valid
+        if t_lower in col_names_lower:
+            continue
+        # Also check if it's an alias defined with AS token
+        if re.search(rf"\bAS\s+[`\"']?{re.escape(token)}[`\"']?\b", sql, re.IGNORECASE):
+            continue
+
+    return True, ""
+
 def generate_sql(
     question: str, 
     session_id: str = "default_session", 
     max_retries: int = 2, 
     table_name: Optional[str] = None, 
     columns: Optional[list] = None,
-    user_margin: Optional[float] = None
+    user_margin: Optional[float] = None,
+    sample_rows: Optional[list] = None,
+    error_feedback: Optional[str] = None
 ) -> str:
     """
-    Translates a natural language question into safe SQLite SQL.
-    Strictly data-driven: never assumes or invents default profit margins.
+    Translates a natural language question into dialect-aware safe SQL (PostgreSQL or SQLite).
+    Strictly data-driven: uses actual schema and sample rows without assuming sales columns.
     Uses Gemini as sole AI provider.
     """
+    dialect = get_db_dialect()
+
     if user_margin is None:
         user_margin = extract_explicit_margin(question)
 
     if table_name and columns:
+        quoted_table_name = quote_ident(table_name)
         schema_lines = [
-            f"DATABASE/DATASET:\n`{table_name}`\n",
-            "AVAILABLE COLUMNS & TYPES:"
+            f"TARGET DATABASE DIALECT: {dialect.upper()}",
+            f"TARGET TABLE: {quoted_table_name}",
+            "AVAILABLE COLUMNS & DATA TYPES:"
         ]
         for col in columns:
-            schema_lines.append(f"  - {col['name']}: {col['type']}")
+            col_n = col["name"] if isinstance(col, dict) else str(col)
+            col_t = col.get("type", "VARCHAR") if isinstance(col, dict) else "VARCHAR"
+            schema_lines.append(f"  - {col_n} ({col_t})")
+        
+        # Include sample rows if available
+        if sample_rows and len(sample_rows) > 0:
+            schema_lines.append("\nREPRESENTATIVE SAMPLE ROWS (first 3 rows):")
+            for i, r in enumerate(sample_rows[:3]):
+                sample_preview = {k: str(v)[:40] for k, v in r.items() if v is not None}
+                schema_lines.append(f"  Row {i+1}: {json.dumps(sample_preview)}")
+
         schema_text = "\n".join(schema_lines)
-        target_table_info = f"Target Table: You MUST execute queries exclusively on the table `{table_name}`. Do NOT query 'sales' or any other table."
-        date_col = next((c["name"] for c in columns if "date" in c["name"].lower() or "time" in c["name"].lower()), "order_date")
+        target_table_info = f"Target Table: You MUST execute queries exclusively on the table {quoted_table_name}. Do NOT query 'sales' or any other table."
         
-        col_names_lower = [c["name"].lower() for c in columns]
+        col_names = [c["name"] if isinstance(c, dict) else str(c) for c in columns]
+        col_names_lower = [c.lower() for c in col_names]
+        date_col = next((c for c in col_names if "date" in c.lower() or "time" in c.lower() or "created" in c.lower() or "year" in c.lower()), None)
+        
         hints = []
-        if "discounted_price" in col_names_lower or "retail_price" in col_names_lower or "unitprice" in col_names_lower:
-            hints.append("- For revenue, sales, earnings, or price calculations, use the available price column (such as `discounted_price`, `retail_price`, or `unitprice`).")
-        if "product_category_tree" in col_names_lower:
-            hints.append("- For category grouping, use `product_category_tree` or `brand`.")
-        if "crawl_timestamp" in col_names_lower:
-            hints.append("- For dates or monthly trends, you can use `substr(crawl_timestamp, 1, 7)` to group by 'YYYY-MM'.")
-        
+        # Dynamic Hints without assuming sales
         # Profit column identification
-        profit_col = next((c["name"] for c in columns if c["name"].lower() in ["profit", "net_profit", "gross_profit", "profit_amount", "total_profit", "earnings"]), None)
-        margin_col = next((c["name"] for c in columns if c["name"].lower() in ["profit_margin", "profit_margin_percent", "margin_percent", "margin_percentage", "margin"]), None)
-        rev_col = next((c["name"] for c in columns if any(k in c["name"].lower() for k in ["revenue", "sales", "total_amount", "discounted_price", "retail_price", "unitprice"])), "revenue")
+        profit_col = next((c for c in col_names if c.lower() in ["profit", "net_profit", "gross_profit", "profit_amount", "total_profit", "earnings"]), None)
+        margin_col = next((c for c in col_names if c.lower() in ["profit_margin", "profit_margin_percent", "margin_percent", "margin_percentage", "margin"]), None)
+        rev_col = next((c for c in col_names if any(k in c.lower() for k in ["revenue", "sales", "total_amount", "salary", "spend", "visits", "amount", "price"])), col_names[0] if col_names else "amount")
 
         if profit_col:
             hints.append(f"- ACTUAL PROFIT DATA: The table contains a real profit column `{profit_col}`. Use this column directly for any profit queries. Never apply any assumed margin.")
@@ -196,16 +265,41 @@ def generate_sql(
         
         extra_hints = "\n".join(hints)
     else:
+        dialect_upper = dialect.upper()
+        quoted_table_name = quote_ident("sales")
         schema_text = format_schema()
-        target_table_info = "Target Table: Only use the tables and columns defined in the schema below."
+        target_table_info = f"Target Table: Only use the tables and columns defined in the schema below ({quoted_table_name})."
         date_col = "order_date"
         extra_hints = "- If the table contains an actual profit column, use it. Never assume 18% or any default profit margin."
 
     context_text = get_history_context(session_id)
 
+    # Dialect specific instructions
+    if dialect == "postgresql":
+        dialect_instructions = """
+3. DATABASE DIALECT: PostgreSQL
+   - Use valid PostgreSQL SQL syntax.
+   - NEVER use MySQL backticks (`). Use double quotes for identifiers if needed (e.g. "order_date"), or clean unquoted identifiers.
+   - Date & Time Functions:
+     * For monthly grouping or trends, use TO_CHAR(CAST({date_col} AS TIMESTAMP), 'YYYY-MM') or DATE_TRUNC('month', CAST({date_col} AS TIMESTAMP)) or SUBSTR(CAST({date_col} AS TEXT), 1, 7).
+     * NEVER use SQLite strftime() or substr() on date objects.
+   - Numeric Functions:
+     * Use standard PostgreSQL functions: COALESCE, NULLIF, ROUND, CAST(... AS NUMERIC).
+     * If stripping currency symbols from strings: CAST(REGEXP_REPLACE(CAST(col AS TEXT), '[$,₹€£¥%\\s]', '', 'g') AS NUMERIC).
+"""
+    else:
+        dialect_instructions = """
+3. DATABASE DIALECT: SQLite
+   - Use valid SQLite syntax.
+   - For monthly calculations, use strftime('%Y-%m', {date_col}) or substr(CAST({date_col} AS TEXT), 1, 7).
+   - If stripping currency symbols: CAST(REPLACE(REPLACE(REPLACE(REPLACE(CAST(col AS TEXT), '$', ''), '₹', ''), ',', ''), ' ', '') AS REAL).
+"""
+
+    date_col_str = quote_ident(date_col) if date_col else "date_column"
+
     system_prompt = f"""You are an SQL generation engine for an AI Business Analytics application.
 
-Generate read-only SQLite SQL using ONLY the supplied dataset/schema.
+Generate read-only {dialect.upper()} SQL using ONLY the supplied dataset and schema.
 
 Never invent columns.
 Never invent tables.
@@ -226,29 +320,18 @@ Do not fabricate data.
 Rules for SQL generation:
 1. Only generate read-only SELECT and WITH statements. Do not generate INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, or other database-modifying commands.
 2. {target_table_info}
-3. The database dialect is SQLite. Ensure all functions used are valid SQLite functions.
-4. Date & Time Mapping:
-   - If the user question references date ranges, months, years, or time trends, map them to `{date_col}`.
-   - For monthly calculations, use strftime('%Y-%m', `{date_col}`) or substr(`{date_col}`, 1, 7).
-5. Analytical Questions & Trends Handling:
-   - For questions like "What trends do you see in my data?", "Show trends over time", or sales growth:
-     * If a date/time column is available, group by month (e.g. strftime('%Y-%m', `{date_col}`) or substr(`{date_col}`, 1, 7)) or year, and aggregate key business metrics like total sales/revenue or total orders.
-     * If NO date/time column is available, analyze key categorical dimensions (e.g. top categories by revenue, top products, or regional distribution) to show distribution patterns across your data.
-   - For "What are my top products?": Group by product/item and order by revenue/sales or quantity sold DESC LIMIT 10.
-   - For "Which category has the highest sales?": Group by category and order by revenue/sales DESC LIMIT 1.
-   - For "What is my total revenue?": Calculate SUM of the available revenue or price column.
-   - For "Which region performs best?": Group by region and order by total sales/revenue DESC LIMIT 1.
-   - For "Compare categories": Group by category and aggregate total sales and transaction counts.
-6. STRICT PROFIT INTEGRITY RULES:
+{dialect_instructions.format(date_col=date_col_str)}
+4. Analytical Questions & Trends Handling:
+   - For questions about trends:
+     * If a date column is available, group by month or year and aggregate key business metrics.
+     * If NO date column is available, analyze key categorical dimensions (e.g. top categories, distributions).
+   - For top items: Group by entity and order by numeric metric DESC LIMIT 10.
+   - For total metric: Calculate SUM or COUNT of available column.
+   - For comparisons: Group by dimension and aggregate key metrics.
+5. STRICT PROFIT INTEGRITY RULES:
    - Profit calculation must be strictly data-driven, never assumption-driven.
    - NEVER invent, assume, infer, or calculate a default profit margin (e.g. NEVER assume 18%, 20%, or any arbitrary percentage).
-   - Only generate SQL involving profit when:
-     a) An actual profit column exists in the schema.
-     b) An actual profit margin column exists in the schema.
-     c) The user explicitly provided a profit margin in their question.
-   - If none of these exist, DO NOT generate fake/estimated profit calculations.
-7. Numeric & Currency Sanitization:
-   - If any numeric, price, revenue, profit, or count column might contain currency symbols ($, ₹, €, £) or commas, safely strip them in SQLite using CAST(REPLACE(REPLACE(REPLACE(REPLACE(CAST(col AS TEXT), '$', ''), '₹', ''), ',', ''), ' ', '') AS REAL) before aggregating with SUM/AVG or arithmetic.
+   - Only generate SQL involving profit when real profit/margin columns exist or the user explicitly specified a margin.
 {extra_hints}
 
 {schema_text}
@@ -257,8 +340,10 @@ Previous context:
 {context_text}
 """
 
-    current_prompt = f"User Question: {question}\n\nGenerate the SQLite query:"
-    
+    current_prompt = f"User Question: {question}\n\nGenerate the {dialect.upper()} query:"
+    if error_feedback:
+        current_prompt += f"\n\nPrevious attempt failed with error:\n{error_feedback}\nPlease correct the query to be valid {dialect.upper()} SQL using ONLY the columns in the schema."
+
     retries = 0
     feedback = ""
     
@@ -273,22 +358,83 @@ Previous context:
         if sql == "CANNOT_ANSWER":
             raise CannotAnswerError("The available dataset columns do not contain sufficient data to answer this question.")
 
+        # Clean backticks if model mistakenly generated them in PostgreSQL
+        if dialect == "postgresql":
+            sql = re.sub(r"`([^`]+)`", r'"\1"', sql)
+
         # If a custom table was specified and model erroneously referenced 'sales', sanitize it
         if table_name and table_name.lower() != "sales":
             quoted_t = quote_ident(table_name)
             sql = re.sub(r"\bFROM\s+sales\b", f"FROM {quoted_t}", sql, flags=re.IGNORECASE)
             sql = re.sub(r"\bJOIN\s+sales\b", f"JOIN {quoted_t}", sql, flags=re.IGNORECASE)
 
-        # Validate the generated SQL
+        # Validate the generated SQL for safety
         is_safe, err_msg = is_safe_sql(sql)
-        if is_safe:
-            return sql
-        
-        # If unsafe, increment retry count and provide feedback
-        feedback = f"The query you generated was rejected for safety reasons: {err_msg}. Please regenerate a safe read-only SELECT or WITH statement."
-        retries += 1
+        if not is_safe:
+            feedback = f"The query you generated was rejected for safety reasons: {err_msg}. Please regenerate a safe read-only SELECT or WITH statement."
+            retries += 1
+            continue
+
+        return sql
         
     raise SQLValidationError(f"Failed to generate a safe SQL query after multiple attempts. Last safety error: {feedback}")
+
+
+def execute_query_with_retry(
+    question: str,
+    table_name: str,
+    columns: list,
+    db: Any,
+    session_id: str = "default_session",
+    user_margin: Optional[float] = None,
+    sample_rows: Optional[list] = None,
+    max_correction_retries: int = 2
+) -> tuple[str, list[str], list[dict]]:
+    """
+    Generates and executes SQL with an automated self-correction loop.
+    If database execution fails (e.g. PostgreSQL syntax error or missing column),
+    it captures the exact error and asks the LLM to self-correct using the actual schema.
+    Retries up to max_correction_retries (default: 2).
+    """
+    dialect = get_db_dialect()
+    last_error = None
+    sql = None
+
+    for attempt in range(max_correction_retries + 1):
+        try:
+            error_feedback = None
+            if attempt > 0 and last_error:
+                clean_err = sanitize_db_error_message(str(last_error))
+                error_feedback = f"Database execution error on attempt {attempt}: {clean_err}\nFailed SQL:\n{sql}"
+                logger.warning(f"[execute_query_with_retry] Attempt {attempt} failed with DB error: {clean_err}. Retrying with LLM correction.")
+
+            sql = generate_sql(
+                question=question,
+                session_id=session_id,
+                table_name=table_name,
+                columns=columns,
+                user_margin=user_margin,
+                sample_rows=sample_rows,
+                error_feedback=error_feedback
+            )
+
+            # Execute query against database
+            res_cols, res_rows = execute_query(sql, db)
+            logger.info(f"[execute_query_with_retry] Query succeeded on attempt {attempt + 1}: {len(res_rows)} rows returned.")
+            return sql, res_cols, res_rows
+
+        except (CannotAnswerError, LLMAuthError, LLMModelError, LLMConnectionError, SQLValidationError):
+            raise
+        except Exception as db_err:
+            last_error = db_err
+            logger.warning(f"[execute_query_with_retry] Execution failed on attempt {attempt + 1}: {str(db_err)}")
+            if attempt == max_correction_retries:
+                # Exceeded retries: raise clean error
+                clean_err = sanitize_db_error_message(str(last_error))
+                raise RuntimeError(f"Database execution error after {max_correction_retries + 1} attempts: {clean_err}")
+
+    clean_err = sanitize_db_error_message(str(last_error))
+    raise RuntimeError(f"Database execution failed: {clean_err}")
 
 
 def generate_insights(
