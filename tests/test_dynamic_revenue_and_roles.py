@@ -294,18 +294,18 @@ class TestDynamicRevenueAndRoles(unittest.TestCase):
         self.assertEqual(data["metrics"]["total_revenue"], 351.0)
 
     def test_scenario_14_price_without_quantity(self):
-        # Price alone is NOT revenue. Primary metric is Average Price.
+        # Price alone is NOT revenue. Revenue must be 0 and not substituted.
         data = get_dashboard_data(self.db, "scen14_price_no_qty")
         self.assertEqual(data["metrics"]["total_revenue"], 0.0)
         self.assertEqual(data["metrics"]["average_price"], 50.0)
-        self.assertEqual(data["metrics"]["metric_labels"]["primary_metric_title"], "Average Price")
+        self.assertEqual(data["metrics"]["metric_labels"]["primary_metric_title"], "Total Revenue")
 
     def test_scenario_15_quantity_without_price(self):
-        # Quantity alone is NOT revenue. Primary metric is Total Quantity.
+        # Quantity alone is NOT revenue. Revenue must be 0 and not substituted.
         data = get_dashboard_data(self.db, "scen15_qty_no_price")
         self.assertEqual(data["metrics"]["total_revenue"], 0.0)
         self.assertEqual(data["metrics"]["total_quantity"], 40.0)
-        self.assertEqual(data["metrics"]["metric_labels"]["primary_metric_title"], "Total Quantity")
+        self.assertEqual(data["metrics"]["metric_labels"]["primary_metric_title"], "Total Revenue")
 
     def test_scenario_16_revenue_and_tax(self):
         # Revenue = 700. Tax = 70 (kept separate, not added to revenue)

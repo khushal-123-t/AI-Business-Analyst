@@ -82,10 +82,10 @@ export default function Dashboard() {
       {/* KPI Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
         <KPICard
-          title={metrics.metric_labels?.primary_metric_title || "Total Revenue"}
+          title={metrics.metric_labels?.revenue_title || metrics.metric_labels?.primary_metric_title || "Total Revenue"}
           value={formatCurrency(metrics.total_revenue)}
           icon={DollarSign}
-          description="Gross warehouse value"
+          description="Total revenue"
           color="indigo"
         />
         <KPICard

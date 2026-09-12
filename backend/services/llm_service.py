@@ -243,19 +243,19 @@ def generate_sql(
             if role == FinancialRole.IDENTIFIER:
                 schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: IDENTIFIER / UNIQUE KEY — COUNT only, NEVER SUM or AVG]")
             elif role in [FinancialRole.UNIT_PRICE, FinancialRole.SELLING_PRICE]:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Unit price. Price alone without quantity is NOT revenue; yields Average Price]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Unit price. Price alone without quantity is NOT revenue; yields Average Price]")
             elif role == FinancialRole.QUANTITY:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: QUANTITY — Units/Volume. Quantity alone without price is NOT revenue; yields Total Quantity]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Units/Volume. Quantity alone without price is NOT revenue; yields Total Quantity]")
             elif role in [FinancialRole.GROSS_REVENUE, FinancialRole.NET_REVENUE]:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Authoritative revenue/sales column]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Authoritative revenue/sales column]")
             elif role == FinancialRole.DISCOUNT_AMOUNT:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: DISCOUNT_AMOUNT — Deducted monetary discount]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Deducted monetary discount]")
             elif role == FinancialRole.DISCOUNT_PERCENT:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: DISCOUNT_PERCENT — Percentage discount to deduct]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Percentage discount to deduct]")
             elif role in [FinancialRole.REFUND, FinancialRole.RETURN]:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Refund/return to deduct from revenue]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Refund/return to deduct from revenue]")
             elif role in [FinancialRole.TAX_AMOUNT, FinancialRole.TAX_PERCENT, FinancialRole.SHIPPING_FEE, FinancialRole.OTHER_FEE, FinancialRole.COGS, FinancialRole.COST_PRICE]:
-                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role.value} — Separate financial metric; do NOT automatically add to revenue]")
+                schema_lines.append(f"  - {col_n} ({col_t}) [ROLE: {role} — Separate financial metric; do NOT automatically add to revenue]")
             else:
                 schema_lines.append(f"  - {col_n} ({col_t})")
         
@@ -368,10 +368,18 @@ Rules for SQL generation:
      * If duplicate Payment IDs are possible, use COUNT(DISTINCT payment_id).
    - For monetary amounts (e.g. 'total payment amount', 'total revenue', 'total amount', 'average payment amount'):
      * Use the actual monetary column (such as payment_amount, amount, revenue), NEVER payment_id.
-7. STRICT INTELLIGENT REVENUE CALCULATION RULES:
-   - Do NOT assume Revenue = Price × Quantity in every case. Inspect the actual dataset schema and roles.
+7. STRICT REVENUE INTEGRITY RULES:
+   - Revenue must NEVER be inferred from arbitrary numeric columns.
+   - The absence of a valid revenue column means Revenue = 0 unless a valid Price × Quantity calculation is possible.
+   - Year, date, IDs, counts, quantity alone, price alone, ratings, salary, age, scores, and other unrelated numeric columns are NOT revenue.
+   - The LLM must not generate SQL such as:
+     SELECT SUM(year) ...
+     SELECT SUM(id) ...
+     SELECT SUM(quantity) ...
+     SELECT SUM(price) ...
+     and label the result Revenue.
    - REVENUE CALCULATION PRECEDENCE:
-     1) Explicit Total / Net Revenue: If an authoritative revenue column exists (e.g. net_revenue, revenue, total_revenue, total_amount, line_total), use SUM(column) directly as revenue. Do NOT recalculate as price * quantity.
+     1) Explicit Total / Net Revenue: If an authoritative revenue column exists (e.g. net_revenue, revenue, total_revenue, sales, total_sales, sales_amount, sales_value, total_amount, order_total, invoice_total, transaction_amount, payment_amount, grand_total, subtotal, line_total, extended_price, total_value), use SUM(column) directly as revenue. Do NOT recalculate as price * quantity.
      2) Gross Sales with Deductions: If gross sales exists along with discount or refund columns: calculate Revenue = SUM(gross_sales - COALESCE(discount, 0) - COALESCE(refund, 0)).
      3) Price and Quantity: If both unit price and quantity exist:
         * Base revenue = SUM(price * quantity)
@@ -379,6 +387,8 @@ Rules for SQL generation:
         * If discount percentage exists: SUM((price * quantity) * (1.0 - (COALESCE(discount, 0) / 100.0)))
         * If refunds exist: subtract COALESCE(refund, 0)
      4) Payment Amount: If payment_amount exists, use SUM(payment_amount).
+     5) If NO valid revenue field and NO valid Price × Quantity relationship exist:
+        Revenue is ZERO (0). If asked for revenue/sales, return SELECT 0 AS total_revenue. NEVER sum Year, Price alone, Quantity alone, ID, or unrelated numeric columns as revenue.
    - PRICE WITHOUT QUANTITY: If the dataset has unit_price / price but NO quantity column, price alone is NOT revenue. Treat it as unit price (e.g. calculate AVG(price) for average price, or COUNT(*) for item count). NEVER calculate SUM(price) as total revenue.
    - QUANTITY WITHOUT PRICE: If the dataset has quantity but NO price column, calculate SUM(quantity) as total units/volume, NOT revenue.
    - TAX, SHIPPING, FEES, COSTS: Keep taxes, shipping fees, processing fees, and COGS/cost separate. NEVER automatically add taxes or shipping to revenue unless the user explicitly requests gross receipts including taxes/shipping.
@@ -413,8 +423,8 @@ Previous context:
             sql = re.sub(r"`([^`]+)`", r'"\1"', sql)
 
         # If a custom table was specified and model erroneously referenced 'sales', sanitize it
+        quoted_t = quote_ident(table_name) if table_name else quote_ident("sales")
         if table_name and table_name.lower() != "sales":
-            quoted_t = quote_ident(table_name)
             sql = re.sub(r"\bFROM\s+sales\b", f"FROM {quoted_t}", sql, flags=re.IGNORECASE)
             sql = re.sub(r"\bJOIN\s+sales\b", f"JOIN {quoted_t}", sql, flags=re.IGNORECASE)
 
@@ -433,6 +443,42 @@ Previous context:
                     # Final safety fallback: convert SUM/AVG on identifier to COUNT
                     logger.warning(f"[generate_sql] Converting disallowed {agg_func}({agg_col}) to COUNT({agg_col})")
                     sql = re.sub(rf"\b{agg_func}\s*\(\s*(DISTINCT\s+)?([\"`]?{re.escape(agg_col)}[\"`]?)\s*\)", r"COUNT(\1\2)", sql, flags=re.IGNORECASE)
+
+        # Validate that Revenue queries do NOT aggregate invalid columns (Requirement 11)
+        is_revenue_query = bool(
+            re.search(r"\b(revenue|total_revenue|sales|total_sales|gross_sales)\b", sql, re.IGNORECASE) or
+            re.search(r"\b(revenue|total revenue|sales|total sales)\b", question, re.IGNORECASE)
+        )
+        if is_revenue_query:
+            invalid_agg_detected = False
+            for sum_match in re.finditer(r"\bSUM\s*\(\s*(?:DISTINCT\s+)?([\"`]?)([a-zA-Z0-9_]+)\1\s*\)", sql, re.IGNORECASE):
+                agg_col = sum_match.group(2)
+                col_norm = agg_col.lower()
+                role = classify_column_role(agg_col)
+
+                is_disallowed_rev = (
+                    is_identifier_column(agg_col) or
+                    col_norm in ("year", "yr", "month", "day", "date", "timestamp", "created_at", "updated_at", "order_date", "transaction_date") or
+                    col_norm.endswith(("_year", "_yr", "_month", "_day", "_date")) or
+                    role in (FinancialRole.IDENTIFIER, FinancialRole.OTHER, FinancialRole.TAX_PERCENT, FinancialRole.DISCOUNT_PERCENT) or
+                    (role == FinancialRole.QUANTITY and not any(p in sql.lower() for p in ("price", "rate", "cost"))) or
+                    (role in (FinancialRole.UNIT_PRICE, FinancialRole.SELLING_PRICE) and not any(q in sql.lower() for q in ("qty", "quantity", "units"))) or
+                    col_norm in ("salary", "age", "experience", "rating", "score", "employee_count", "department_code", "tenure")
+                )
+
+                if is_disallowed_rev:
+                    invalid_agg_detected = True
+                    if retries < max_retries:
+                        feedback = f"Column '{agg_col}' is NOT a valid revenue source. Year, date, IDs, quantity alone, price alone, counts, and unrelated numeric columns must NEVER be summed as revenue. If no valid revenue field or price * quantity expression exists, return SELECT 0 AS total_revenue."
+                        logger.warning(f"[generate_sql] Disallowed SUM({agg_col}) as revenue. Retrying.")
+                        retries += 1
+                        break
+                    else:
+                        logger.warning(f"[generate_sql] Fallback: converting disallowed revenue SUM({agg_col}) to 0 AS total_revenue")
+                        sql = f"SELECT 0 AS total_revenue FROM {quoted_t} LIMIT 1"
+                        break
+            if invalid_agg_detected and retries <= max_retries and sql != f"SELECT 0 AS total_revenue FROM {quoted_t} LIMIT 1":
+                continue
 
         # Validate the generated SQL for safety
         is_safe, err_msg = is_safe_sql(sql)

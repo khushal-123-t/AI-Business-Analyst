@@ -2,7 +2,7 @@ import re
 from typing import Dict, Any, List, Optional
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
-from backend.database.connection import quote_ident, engine
+from backend.database.connection import quote_ident, engine, clean_numeric_sql
 
 NUMERIC_TYPE_KEYWORDS = ("INT", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "BIGINT", "SMALLINT")
 DATE_TYPE_KEYWORDS = ("DATE", "TIME", "TIMESTAMP")
@@ -52,8 +52,12 @@ def is_identifier_column(col_name: str) -> bool:
     tokens = norm.split('_')
 
     # Exact standard ID tokens
-    if norm in ("id", "uuid", "guid", "code", "index", "idx", "key", "token", "hash", "pk", "fk"):
+    if norm in ("id", "uuid", "guid", "code", "index", "idx", "key", "token", "hash", "pk", "fk", "zip", "zipcode", "postal_code", "postcode", "pin_code", "pincode", "serial_number", "phone_number", "account_number"):
         return True
+
+    # Date/Time & Year columns are temporal dimensions, NEVER identifiers
+    if norm in ("year", "yr", "month", "day", "date", "quarter", "qtr", "time", "hour", "minute", "second", "timestamp", "datetime", "created_at", "updated_at", "order_date", "transaction_date") or norm.endswith(("_year", "_yr", "_month", "_day", "_date", "_timestamp", "_datetime")):
+        return False
 
     # Check if this column is explicitly a measure/quantity/count
     if norm.startswith(("number_of_", "num_of_", "count_of_")):
@@ -116,6 +120,14 @@ def classify_column_role(col_name: str, ctype: str = "", sample_vals: list = Non
 
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', str(col_name).strip()).lower()
     norm = re.sub(r'[^a-z0-9]+', '_', s).strip('_')
+
+    # Date/Time & Year columns are temporal dimensions, NEVER revenue or identifiers
+    if norm in ("year", "yr", "month", "day", "date", "quarter", "qtr", "time", "hour", "minute", "second", "timestamp", "datetime", "created_at", "updated_at", "order_date", "transaction_date") or norm.endswith(("_year", "_yr", "_month", "_day", "_date", "_timestamp", "_datetime")):
+        return FinancialRole.OTHER
+
+    # Unrelated numeric business metrics (HR, demographic, survey, education) are NEVER revenue
+    if norm in ("age", "salary", "experience", "rating", "score", "employee_count", "department_code", "tenure", "gpa", "marks", "rank", "level", "weight", "height", "duration", "distance", "step", "steps", "count"):
+        return FinancialRole.OTHER
 
     # 2. Rates, percentages, and ratios that are NOT monetary amounts
     if norm.endswith(("_rate", "_ratio", "_pct", "_percent", "_percentage")) or norm in ("rate", "ratio", "pct", "percent", "percentage"):
@@ -443,7 +455,7 @@ def inspect_dataset_schema(db: Session, table_name: str) -> Dict[str, Any]:
     if not primary_name:
         primary_name = categorical_columns[0] if categorical_columns else (primary_id or "Item")
 
-    return {
+    schema_dict = {
         "table_name": table_name,
         "dialect": dialect_name,
         "row_count": row_count,
@@ -479,4 +491,228 @@ def inspect_dataset_schema(db: Session, table_name: str) -> Dict[str, Any]:
         "refund_col": refund_col,
         "cost_col": cost_col,
         "payment_amount_col": payment_amount_col
+    }
+
+    schema_dict["resolved_revenue"] = resolve_revenue_metric(
+        columns=columns,
+        financial_roles=financial_roles,
+        dialect=dialect_name,
+        schema=schema_dict
+    )
+
+    return schema_dict
+
+def resolve_revenue_metric(
+    db: Optional[Session] = None,
+    table_name: Optional[str] = None,
+    schema: Optional[Dict[str, Any]] = None,
+    columns: Optional[List[str]] = None,
+    financial_roles: Optional[Dict[str, str]] = None,
+    dialect: str = "sqlite"
+) -> Dict[str, Any]:
+    """
+    Single authoritative function to resolve the Revenue metric.
+    Strictly ensures the Revenue KPI represents ONLY actual revenue.
+    Never falls back to summing arbitrary numeric columns (e.g. Year, Date, IDs, Quantity alone, Price alone, Salary, Age).
+
+    Resolution Hierarchy:
+    1. Authoritative explicit revenue column (NET_REVENUE or PAYMENT_AMOUNT)
+    2. Gross revenue / gross sales with deductions (GROSS_REVENUE)
+    3. Price * Quantity with deductions (SELLING_PRICE / UNIT_PRICE AND QUANTITY)
+    4. ELSE: value = 0, is_valid = False, source = 'No valid revenue source'
+    """
+    if schema is None and db is not None and table_name is not None:
+        schema = inspect_dataset_schema(db, table_name)
+
+    if schema is not None:
+        if columns is None:
+            columns = schema.get("columns", [])
+        if financial_roles is None:
+            financial_roles = schema.get("financial_roles", {})
+        dialect = schema.get("dialect", dialect)
+
+    if columns is None:
+        columns = []
+    if financial_roles is None:
+        financial_roles = {}
+
+    for c in columns:
+        if c not in financial_roles:
+            financial_roles[c] = classify_column_role(c)
+
+    NUMERIC_TYPES = ("FLOAT", "REAL", "INT", "DOUBLE", "DECIMAL", "NUMERIC", "BIGINT", "SMALLINT")
+    col_type_map = schema.get("column_types", {}) if schema else {}
+
+    def col_expr(c: str) -> str:
+        ctype = col_type_map.get(c, "").upper()
+        quoted = quote_ident(c)
+        if ctype and any(t in ctype for t in NUMERIC_TYPES):
+            return quoted
+        return clean_numeric_sql(quoted, dialect=dialect)
+
+    # 1. Authoritative explicit revenue column
+    authoritative_rev = None
+    REVENUE_PREFERENCE = (
+        "net_revenue", "net_sales", "total_revenue", "totalrevenue", "revenue",
+        "sales", "total_sales", "sales_amount", "sales_value", "total_amount",
+        "order_total", "invoice_total", "transaction_amount", "payment_amount",
+        "grand_total", "subtotal", "line_total", "extended_price", "total_value",
+        "final_amount", "net_amount"
+    )
+    for pref in REVENUE_PREFERENCE:
+        for c in columns:
+            r = financial_roles.get(c)
+            if r in (FinancialRole.NET_REVENUE, FinancialRole.PAYMENT_AMOUNT) and (c.lower() == pref or pref in c.lower()) and not is_identifier_column(c):
+                authoritative_rev = c
+                break
+        if authoritative_rev:
+            break
+
+    if not authoritative_rev:
+        authoritative_rev = next(
+            (c for c in columns if financial_roles.get(c) in (FinancialRole.NET_REVENUE, FinancialRole.PAYMENT_AMOUNT) and not is_identifier_column(c)),
+            None
+        )
+
+    # 2. Gross Sales column
+    gross_sales_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.GROSS_REVENUE and not is_identifier_column(c)),
+        None
+    )
+
+    # 3. Price & Quantity columns
+    selling_price_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.SELLING_PRICE and not is_identifier_column(c)),
+        None
+    )
+    unit_price_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.UNIT_PRICE and not is_identifier_column(c)),
+        None
+    )
+    price_col = selling_price_col or unit_price_col
+
+    quantity_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.QUANTITY and not is_identifier_column(c)),
+        None
+    )
+
+    # Deductions: Discount & Refund
+    discount_amount_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.DISCOUNT_AMOUNT and not is_identifier_column(c)),
+        None
+    )
+    discount_percent_col = next(
+        (c for c in columns if financial_roles.get(c) == FinancialRole.DISCOUNT_PERCENT and not is_identifier_column(c)),
+        None
+    )
+    discount_col = discount_amount_col or discount_percent_col
+    discount_type = "PERCENT" if discount_percent_col else ("AMOUNT" if discount_amount_col else None)
+
+    refund_col = next(
+        (c for c in columns if financial_roles.get(c) in (FinancialRole.REFUND, FinancialRole.RETURN) and not is_identifier_column(c)),
+        None
+    )
+
+    has_real_revenue = False
+    is_valid = False
+    revenue_expr = "0"
+    gross_sales_expr = None
+    revenue_source = "No valid revenue source"
+    label = "Revenue"
+
+    # Hierarchy 1: Authoritative explicit revenue column
+    if authoritative_rev and authoritative_rev in columns and not is_identifier_column(authoritative_rev):
+        has_real_revenue = True
+        is_valid = True
+        is_already_net = any(k in authoritative_rev.lower() for k in ("net", "total_revenue", "totalrevenue", "final", "settled", "grand_total"))
+        if not is_already_net and (refund_col or discount_col):
+            gross_sales_expr = col_expr(authoritative_rev)
+            parts = [gross_sales_expr]
+            if discount_col and discount_col in columns:
+                if discount_type == "PERCENT":
+                    parts.append(f"- COALESCE(({gross_sales_expr} * ({col_expr(discount_col)} / 100.0)), 0)")
+                else:
+                    parts.append(f"- COALESCE({col_expr(discount_col)}, 0)")
+            if refund_col and refund_col in columns:
+                parts.append(f"- COALESCE({col_expr(refund_col)}, 0)")
+            revenue_expr = f"({' '.join(parts)})"
+            revenue_source = "revenue_minus_deductions"
+            label = "Net Revenue"
+        else:
+            revenue_expr = col_expr(authoritative_rev)
+            gross_sales_expr = col_expr(gross_sales_col) if (gross_sales_col and gross_sales_col in columns) else revenue_expr
+            revenue_source = "authoritative_revenue"
+            label = authoritative_rev.replace("_", " ").title()
+
+    # Hierarchy 2: Gross Sales with optional deductions
+    elif gross_sales_col and gross_sales_col in columns and not is_identifier_column(gross_sales_col):
+        has_real_revenue = True
+        is_valid = True
+        gross_sales_expr = col_expr(gross_sales_col)
+        parts = [gross_sales_expr]
+        if discount_col and discount_col in columns:
+            if discount_type == "PERCENT":
+                parts.append(f"- COALESCE(({gross_sales_expr} * ({col_expr(discount_col)} / 100.0)), 0)")
+            else:
+                parts.append(f"- COALESCE({col_expr(discount_col)}, 0)")
+        if refund_col and refund_col in columns:
+            parts.append(f"- COALESCE({col_expr(refund_col)}, 0)")
+        revenue_expr = f"({' '.join(parts)})"
+        revenue_source = "gross_sales_with_deductions"
+        label = "Net Revenue"
+
+    # Hierarchy 3: Price * Quantity with optional deductions
+    elif price_col and quantity_col and price_col in columns and quantity_col in columns and not is_identifier_column(price_col) and not is_identifier_column(quantity_col):
+        has_real_revenue = True
+        is_valid = True
+        gross_sales_expr = f"({col_expr(price_col)} * {col_expr(quantity_col)})"
+        parts = [gross_sales_expr]
+        if discount_col and discount_col in columns:
+            if discount_type == "PERCENT":
+                parts.append(f"- COALESCE(({gross_sales_expr} * ({col_expr(discount_col)} / 100.0)), 0)")
+            else:
+                parts.append(f"- COALESCE({col_expr(discount_col)}, 0)")
+        if refund_col and refund_col in columns:
+            parts.append(f"- COALESCE({col_expr(refund_col)}, 0)")
+        revenue_expr = f"({' '.join(parts)})"
+        revenue_source = "price_times_quantity"
+        label = "Net Sales" if (discount_col or refund_col) else "Revenue"
+
+    # Hierarchy 4: ABSOLUTELY NO FALLBACK
+    # Price alone, Quantity alone, Year, Date, ID, Cost, Profit, Tax, Shipping, Salary, Age, etc. are NOT revenue
+    else:
+        has_real_revenue = False
+        is_valid = False
+        revenue_expr = "0"
+        gross_sales_expr = None
+        revenue_source = "No valid revenue source"
+        label = "Revenue"
+
+    value = 0.0
+    if db is not None and table_name is not None and has_real_revenue and is_valid:
+        try:
+            q = f"SELECT COALESCE(SUM({revenue_expr}), 0) FROM {quote_ident(table_name)}"
+            res = db.execute(text(q)).scalar()
+            value = float(res) if res is not None else 0.0
+        except Exception:
+            value = 0.0
+    else:
+        value = 0.0
+
+    return {
+        "metric": "revenue",
+        "label": label,
+        "value": round(float(value), 2),
+        "source": revenue_source,
+        "is_valid": is_valid,
+        "has_real_revenue": has_real_revenue,
+        "revenue_expr": revenue_expr,
+        "rev_kpi_expr": f"COALESCE(SUM({revenue_expr}), 0)" if has_real_revenue else "0.0",
+        "gross_sales_expr": gross_sales_expr,
+        "raw_rev_col": authoritative_rev or gross_sales_col,
+        "price_col": price_col,
+        "quantity_col": quantity_col,
+        "discount_col": discount_col,
+        "discount_type": discount_type,
+        "refund_col": refund_col
     }

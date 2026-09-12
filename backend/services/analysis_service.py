@@ -3,7 +3,7 @@ import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import text, inspect
 from backend.database.connection import quote_ident
-from backend.services.schema_service import inspect_dataset_schema, is_identifier_column, FinancialRole
+from backend.services.schema_service import inspect_dataset_schema, is_identifier_column, FinancialRole, resolve_revenue_metric
 
 def format_identifier_count_title(col_name: str) -> str:
     """
@@ -324,109 +324,33 @@ def resolve_columns(db: Session, table_name: str, user_margin: float = None) -> 
         cust_name_col = schema["primary_name"]
 
     # -------------------------------------------------------------
-    # REVENUE CALCULATION HIERARCHY (11)
+    # STRICT REVENUE RESOLUTION (Single Authoritative Function)
     # -------------------------------------------------------------
     roles = schema.get("financial_roles", {})
-    has_real_revenue = False
-    revenue_expr = "1"
-    gross_sales_expr = None
-    revenue_source = "none"
-    metric_name = "Records Count"
+    if authoritative_rev and roles.get(authoritative_rev) not in (FinancialRole.NET_REVENUE, FinancialRole.PAYMENT_AMOUNT):
+        roles[authoritative_rev] = FinancialRole.NET_REVENUE
+    if gross_sales_col and roles.get(gross_sales_col) != FinancialRole.GROSS_REVENUE:
+        roles[gross_sales_col] = FinancialRole.GROSS_REVENUE
 
-    # Hierarchy A: Authoritative Explicit Revenue Column (e.g. net_revenue, total_amount, sales)
-    if authoritative_rev and authoritative_rev in columns and not is_identifier_column(authoritative_rev):
-        has_real_revenue = True
-        is_already_net = any(k in authoritative_rev.lower() for k in ("net", "total_revenue", "totalrevenue", "final", "settled", "grand_total"))
-        if not is_already_net and (refund_col or discount_col):
-            gross_sales_expr = safe_col_expr(authoritative_rev)
-            parts = [gross_sales_expr]
-            if discount_col and discount_col in columns:
-                if discount_type == "PERCENT":
-                    parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
-                else:
-                    parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
-            if refund_col and refund_col in columns:
-                parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
-            revenue_expr = f"({' '.join(parts)})"
-            revenue_source = "revenue_minus_deductions"
-            metric_name = "Net Revenue"
-        else:
-            revenue_expr = safe_col_expr(authoritative_rev)
-            gross_sales_expr = safe_col_expr(gross_sales_col) if (gross_sales_col and gross_sales_col in columns) else revenue_expr
-            revenue_source = "authoritative_revenue"
-            metric_name = authoritative_rev.replace("_", " ").title()
+    rev_res = resolve_revenue_metric(
+        columns=columns,
+        financial_roles=roles,
+        dialect=dialect,
+        schema=schema
+    )
 
-    # Hierarchy B: Explicit Gross Sales Column with optional discounts / refunds
-    elif gross_sales_col and gross_sales_col in columns and not is_identifier_column(gross_sales_col):
-        has_real_revenue = True
-        gross_sales_expr = safe_col_expr(gross_sales_col)
-        parts = [gross_sales_expr]
-        if discount_col and discount_col in columns:
-            if discount_type == "PERCENT":
-                parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
-            else:
-                parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
-        if refund_col and refund_col in columns:
-            parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
-        revenue_expr = f"({' '.join(parts)})"
-        revenue_source = "gross_sales_with_deductions"
-        metric_name = "Net Revenue"
+    has_real_revenue = rev_res["has_real_revenue"]
+    revenue_expr = rev_res["revenue_expr"]
+    gross_sales_expr = rev_res["gross_sales_expr"]
+    revenue_source = rev_res["source"]
+    metric_name = rev_res["label"] if has_real_revenue else "Revenue"
 
-    # Hierarchy C: Selling Price × Quantity with optional discounts / refunds
-    elif price_col and qty_col and price_col in columns and qty_col in columns and not is_identifier_column(price_col) and not is_identifier_column(qty_col):
-        has_real_revenue = True
-        gross_sales_expr = f"({safe_col_expr(price_col)} * {safe_col_expr(qty_col)})"
-        parts = [gross_sales_expr]
-        if discount_col and discount_col in columns:
-            if discount_type == "PERCENT":
-                parts.append(f"- COALESCE(({gross_sales_expr} * ({safe_col_expr(discount_col)} / 100.0)), 0)")
-            else:
-                parts.append(f"- COALESCE({safe_col_expr(discount_col)}, 0)")
-        if refund_col and refund_col in columns:
-            parts.append(f"- COALESCE({safe_col_expr(refund_col)}, 0)")
-        revenue_expr = f"({' '.join(parts)})"
-        revenue_source = "price_times_quantity"
-        metric_name = "Net Sales" if (discount_col or refund_col) else "Revenue"
-
-    # Hierarchy D: Payment Amount (in payment datasets)
-    elif payment_amount_col and payment_amount_col in columns and not is_identifier_column(payment_amount_col):
-        has_real_revenue = True
-        revenue_expr = safe_col_expr(payment_amount_col)
-        gross_sales_expr = revenue_expr
-        revenue_source = "payment_amount"
-        metric_name = payment_amount_col.replace("_", " ").title()
-
-    # Hierarchy E: Selling Price in product/transaction datasets (e.g. discounted_price / selling_price without a quantity column)
-    elif selling_price_col and selling_price_col in columns and not is_identifier_column(selling_price_col) and not qty_col and (order_col or cust_name_col or schema.get("id_columns")):
-        has_real_revenue = True
-        revenue_expr = safe_col_expr(selling_price_col)
-        gross_sales_expr = safe_col_expr(unit_price_col) if (unit_price_col and unit_price_col in columns) else revenue_expr
-        revenue_source = "selling_price"
-        metric_name = selling_price_col.replace("_", " ").title()
-
-    # Hierarchy F: Unit Price only (without quantity) -> NOT revenue; Average Price
-    elif price_col and price_col in columns and not is_identifier_column(price_col):
-        has_real_revenue = False
-        revenue_expr = "1"
-        gross_sales_expr = None
-        revenue_source = "price_only"
-        metric_name = "Average Price"
-
-    # Hierarchy F: Quantity only (without price) -> NOT revenue; Total Quantity
-    elif qty_col and qty_col in columns and not is_identifier_column(qty_col):
-        has_real_revenue = False
-        revenue_expr = "1"
-        gross_sales_expr = None
-        revenue_source = "quantity_only"
-        metric_name = "Total Quantity"
-
-    # Hierarchy G: Other valid primary numeric metric
-    elif schema.get("primary_metric") and schema["primary_metric"] in columns and not is_identifier_column(schema["primary_metric"]):
-        has_real_revenue = True
-        revenue_expr = safe_col_expr(schema["primary_metric"])
-        gross_sales_expr = revenue_expr
-        revenue_source = "primary_metric"
-        metric_name = schema["primary_metric"].replace("_", " ").title()
+    # Identify if price_only or quantity_only for separate downstream metrics
+    if not has_real_revenue:
+        if price_col and not qty_col:
+            revenue_source = "price_only"
+        elif qty_col and not price_col:
+            revenue_source = "quantity_only"
 
     # -------------------------------------------------------------
     # SEPARATE FINANCIAL METRIC AGGREGATES
@@ -666,27 +590,17 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     has_rev = cols["has_real_revenue"]
     count_title = cols.get('count_name', 'Total Records')
 
-    if has_rev:
-        primary_metric_title = f"Total {cols.get('metric_name', 'Metric')}"
-        avg_title = f"Average {cols.get('metric_name', 'Metric')}"
-    elif cols.get("revenue_source") == "price_only":
-        primary_metric_title = "Average Price"
-        avg_title = "Average Price"
-    elif cols.get("revenue_source") == "quantity_only":
-        primary_metric_title = "Total Quantity"
-        avg_title = "Average per Record"
-    elif cols.get("has_real_id") and cols.get("count_name"):
-        primary_metric_title = count_title
-        avg_title = "Average per Record"
-    else:
-        primary_metric_title = "Total Records"
-        avg_title = "Average per Record"
+    # The Revenue KPI title must always strictly be Revenue / Total Revenue
+    # It must NEVER be replaced by 'Average Price', 'Total Quantity', 'Total Records', or arbitrary numeric fields
+    primary_metric_title = f"Total {cols.get('metric_name', 'Revenue')}" if has_rev else "Total Revenue"
+    avg_title = "Average Order Value"
 
     category_title = f"{cols.get('category_name', 'Category')} Breakdown"
     region_title = f"{cols.get('region_name', 'Regional')} Distribution"
 
     metric_labels = {
         "primary_metric_title": primary_metric_title,
+        "revenue_title": primary_metric_title,
         "count_title": count_title,
         "average_title": avg_title,
         "category_title": category_title,
@@ -696,10 +610,10 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     # 1. Fetch KPI metrics (Isolated Query)
     orders_expr = cols.get("orders_aggregate") or "COUNT(*)"
     customers_expr = cols.get("customers_aggregate") or "COUNT(*)"
-    revenue_calc_expr = cols['revenue'] if has_rev else "1"
+    revenue_calc_expr = cols['revenue'] if has_rev else "0"
     rev_kpi_expr = f"COALESCE(SUM({cols['revenue']}), 0)" if has_rev else "0.0"
 
-    gross_sales_kpi = f"COALESCE(SUM({cols['gross_sales']}), 0)" if cols.get("gross_sales") else rev_kpi_expr
+    gross_sales_kpi = f"COALESCE(SUM({cols['gross_sales']}), 0)" if (cols.get("gross_sales") and has_rev) else ("NULL" if not has_rev else rev_kpi_expr)
     discounts_kpi = f"COALESCE({cols['discounts_aggregate']}, 0)" if cols.get("discounts_aggregate") else "NULL"
     tax_kpi = f"COALESCE({cols['tax_aggregate']}, 0)" if cols.get("tax_aggregate") else "NULL"
     shipping_kpi = f"COALESCE({cols['shipping_aggregate']}, 0)" if cols.get("shipping_aggregate") else "NULL"
@@ -738,8 +652,8 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
         """
         kpi_res = db.execute(text(kpi_query)).fetchone()
         if kpi_res:
-            total_revenue = float(kpi_res[0]) if kpi_res[0] is not None else 0.0
-            gross_sales = float(kpi_res[1]) if kpi_res[1] is not None else total_revenue
+            total_revenue = float(kpi_res[0]) if (kpi_res[0] is not None and has_rev) else 0.0
+            gross_sales = float(kpi_res[1]) if (kpi_res[1] is not None and has_rev) else (total_revenue if has_rev else None)
             total_discounts = float(kpi_res[2]) if kpi_res[2] is not None else None
             total_tax = float(kpi_res[3]) if kpi_res[3] is not None else None
             total_shipping = float(kpi_res[4]) if kpi_res[4] is not None else None
@@ -758,7 +672,9 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
         except Exception:
             pass
 
-    if cols.get("aov_col"):
+    if not has_rev:
+        average_order_value = 0.0
+    elif cols.get("aov_col"):
         try:
             aov_col_name = cols["aov_col"]
             aov_q = f"SELECT COALESCE(AVG({clean_numeric_sql(quote_ident(aov_col_name), dialect=cols['dialect'])}), 0) FROM {quoted_table}"
@@ -775,7 +691,9 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     revenue_trend = []
     monthly_orders = []
 
-    if not cols.get("has_real_date") or not cols.get("order_date"):
+    if not has_rev:
+        skipped_visualizations.append("Time-series revenue trend chart skipped: dataset does not contain valid revenue or price × quantity data.")
+    elif not cols.get("has_real_date") or not cols.get("order_date"):
         skipped_visualizations.append("Time-series trend chart skipped: dataset does not contain a date or timestamp column.")
     else:
         try:
@@ -823,7 +741,9 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
     revenue_by_category = []
     profit_by_category = []
 
-    if not cols.get("has_real_category"):
+    if not has_rev:
+        skipped_visualizations.append("Category revenue breakdown chart skipped: dataset does not contain valid revenue data.")
+    elif not cols.get("has_real_category"):
         skipped_visualizations.append("Category distribution chart skipped: dataset does not contain a categorical dimension column.")
     else:
         try:
@@ -874,7 +794,9 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
 
     # 4. Revenue by Region / Secondary Category (Isolated)
     revenue_by_region = []
-    if not cols.get("has_real_region"):
+    if not has_rev:
+        skipped_visualizations.append("Regional revenue distribution chart skipped: dataset does not contain valid revenue data.")
+    elif not cols.get("has_real_region"):
         skipped_visualizations.append("Regional distribution chart skipped: dataset does not contain a secondary regional or location dimension.")
     else:
         try:
@@ -897,54 +819,56 @@ def get_dashboard_data(db: Session, table_name: str = "sales", user_margin: floa
 
     # 5. Top 10 Entities / Customers (Isolated)
     top_customers = []
-    try:
-        name_col_quoted = cols['customer_name']
-        if cols["profit_available"] and cols["profit"] is not None:
-            cust_query = f"""
-            SELECT
-                COALESCE(NULLIF(TRIM(CAST({name_col_quoted} AS TEXT)), ''), 'Item') AS customer_name,
-                COALESCE(SUM({revenue_calc_expr}), 0) AS revenue,
-                COALESCE(SUM({cols['profit']}), 0) AS profit
-            FROM {quoted_table}
-            GROUP BY customer_name
-            ORDER BY revenue DESC
-            LIMIT 10
-            """
-            cust_rows = db.execute(text(cust_query)).fetchall()
-            top_customers = [
-                {
-                    "customer_name": str(r[0]),
-                    "revenue": round(float(r[1]), 2),
-                    "profit": round(float(r[2]), 2)
-                }
-                for r in cust_rows
-            ]
-        else:
-            cust_query = f"""
-            SELECT
-                COALESCE(NULLIF(TRIM(CAST({name_col_quoted} AS TEXT)), ''), 'Item') AS customer_name,
-                COALESCE(SUM({revenue_calc_expr}), 0) AS revenue
-            FROM {quoted_table}
-            GROUP BY customer_name
-            ORDER BY revenue DESC
-            LIMIT 10
-            """
-            cust_rows = db.execute(text(cust_query)).fetchall()
-            top_customers = [
-                {
-                    "customer_name": str(r[0]),
-                    "revenue": round(float(r[1]), 2),
-                    "profit": None
-                }
-                for r in cust_rows
-            ]
-    except Exception:
-        top_customers = []
+    if has_rev:
+        try:
+            name_col_quoted = cols['customer_name']
+            if cols["profit_available"] and cols["profit"] is not None:
+                cust_query = f"""
+                SELECT
+                    COALESCE(NULLIF(TRIM(CAST({name_col_quoted} AS TEXT)), ''), 'Item') AS customer_name,
+                    COALESCE(SUM({revenue_calc_expr}), 0) AS revenue,
+                    COALESCE(SUM({cols['profit']}), 0) AS profit
+                FROM {quoted_table}
+                GROUP BY customer_name
+                ORDER BY revenue DESC
+                LIMIT 10
+                """
+                cust_rows = db.execute(text(cust_query)).fetchall()
+                top_customers = [
+                    {
+                        "customer_name": str(r[0]),
+                        "revenue": round(float(r[1]), 2),
+                        "profit": round(float(r[2]), 2)
+                    }
+                    for r in cust_rows
+                ]
+            else:
+                cust_query = f"""
+                SELECT
+                    COALESCE(NULLIF(TRIM(CAST({name_col_quoted} AS TEXT)), ''), 'Item') AS customer_name,
+                    COALESCE(SUM({revenue_calc_expr}), 0) AS revenue
+                FROM {quoted_table}
+                GROUP BY customer_name
+                ORDER BY revenue DESC
+                LIMIT 10
+                """
+                cust_rows = db.execute(text(cust_query)).fetchall()
+                top_customers = [
+                    {
+                        "customer_name": str(r[0]),
+                        "revenue": round(float(r[1]), 2),
+                        "profit": None
+                    }
+                    for r in cust_rows
+                ]
+        except Exception:
+            top_customers = []
 
     profit_margin = round((total_profit / total_revenue) * 100, 2) if total_profit is not None and total_revenue > 0 else None
 
     dashboard_result = {
         "metrics": {
+            "revenue": round(total_revenue, 2),
             "total_revenue": round(total_revenue, 2),
             "gross_sales": round(gross_sales, 2) if gross_sales is not None else None,
             "total_discounts": round(total_discounts, 2) if total_discounts is not None else None,

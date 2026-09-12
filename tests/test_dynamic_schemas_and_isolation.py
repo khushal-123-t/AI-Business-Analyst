@@ -115,30 +115,29 @@ class TestDynamicSchemasAndIsolation(unittest.TestCase):
         self.assertEqual(schema["row_count"], 4)
 
     def test_dashboard_generation_dataset_b_hr(self):
-        """HR dataset should generate valid KPIs and Department breakdown without crashing."""
+        """HR dataset has no revenue: total_revenue must be 0, not sum of salaries."""
         dash = get_dashboard_data(self.db, "test_dataset_b")
         self.assertIsNotNone(dash["metrics"])
-        self.assertEqual(dash["metrics"]["total_revenue"], 348000.0) # Sum of salaries
+        self.assertEqual(dash["metrics"]["total_revenue"], 0.0)
         self.assertEqual(dash["metrics"]["total_orders"], 4)         # 4 employees
-        self.assertEqual(dash["metrics"]["average_order_value"], 87000.0) # Mean salary
-        self.assertTrue(len(dash["revenue_by_category"]) > 0)        # Department breakdown
-        self.assertTrue(len(dash["revenue_trend"]) > 0)              # Hiring trend
+        self.assertEqual(dash["metrics"]["average_order_value"], 0.0)
+        self.assertTrue(any("revenue" in s.lower() for s in dash["skipped_visualizations"]))
 
     def test_dashboard_isolation_dataset_c_no_date(self):
-        """Customer demographics (no date) must gracefully skip trend without crashing."""
+        """Customer demographics (no date, no revenue) must have revenue=0 and gracefully skip charts without crashing."""
         dash = get_dashboard_data(self.db, "test_dataset_c")
         self.assertIsNotNone(dash["metrics"])
+        self.assertEqual(dash["metrics"]["total_revenue"], 0.0)
         self.assertEqual(dash["revenue_trend"], []) # Skipped trend
-        self.assertTrue(any("trend" in s.lower() for s in dash["skipped_visualizations"]))
-        self.assertTrue(len(dash["revenue_by_category"]) > 0) # City breakdown still generated!
+        self.assertTrue(any("trend" in s.lower() or "revenue" in s.lower() for s in dash["skipped_visualizations"]))
 
     def test_dashboard_isolation_dataset_e_no_category(self):
-        """Marketing traffic (no category) must gracefully skip category without crashing."""
+        """Marketing traffic (no category, no revenue) must have revenue=0 and gracefully skip charts without crashing."""
         dash = get_dashboard_data(self.db, "test_dataset_e")
         self.assertIsNotNone(dash["metrics"])
+        self.assertEqual(dash["metrics"]["total_revenue"], 0.0)
         self.assertEqual(dash["revenue_by_category"], []) # Skipped category
-        self.assertTrue(any("category" in s.lower() for s in dash["skipped_visualizations"]))
-        self.assertTrue(len(dash["revenue_trend"]) > 0)   # Date trend still generated!
+        self.assertTrue(any("category" in s.lower() or "revenue" in s.lower() for s in dash["skipped_visualizations"]))
 
     def test_security_sql_validator(self):
         """Verify blocked destructive SQL commands."""

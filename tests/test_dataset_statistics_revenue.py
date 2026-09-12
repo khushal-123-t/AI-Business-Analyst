@@ -45,19 +45,20 @@ class TestDatasetStatisticsRevenue(unittest.TestCase):
         self.assertAlmostEqual(m['average_order_value'], 1282.50, places=2)
 
     def test_dataset_9_amazon_numeric_cleaning(self):
-        """Verify that Amazon table with ₹ and commas properly computes total revenue."""
+        """Verify that Amazon table with ₹ and prices but NO quantity has Revenue=0 (Price alone is not revenue) and computes average_price."""
         table_name = 'dataset_client_4_9e9265977413'
         dashboard = get_dashboard_data(self.db, table_name=table_name)
         m = dashboard["metrics"]
 
         print("\n[TEST] Amazon Metrics:")
         print(f"  Revenue: {m['total_revenue']}")
+        print(f"  Average Price: {m['average_price']}")
         print(f"  Profit: {m['total_profit']}")
         print(f"  Orders: {m['total_orders']}")
 
-        # Total revenue should exceed 4,000,000 (actual: 4,579,580.43) rather than the old truncated 1,399.0
-        self.assertGreater(m['total_revenue'], 4000000.0)
-        self.assertAlmostEqual(m['total_revenue'], 4579580.43, places=2)
+        # Under strict revenue logic, price alone without quantity is NOT revenue -> Revenue = 0.0
+        self.assertEqual(m['total_revenue'], 0.0)
+        self.assertAlmostEqual(m['average_price'], 3125.99, places=2)
         # Profit must be None since no profit column exists
         self.assertIsNone(m['total_profit'])
         self.assertFalse(m['profit_available'])

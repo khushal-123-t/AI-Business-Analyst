@@ -130,3 +130,16 @@ def get_db():
     finally:
         db.close()
 
+
+def clean_numeric_sql(col_expr: str, dialect: str = "sqlite") -> str:
+    """
+    Generates a dialect-safe SQL expression to strip currency symbols ($ ₹ € £ ¥),
+    commas, percentages, and whitespace, casting safely to numeric.
+    Compatible with PostgreSQL and SQLite.
+    """
+    if dialect == "postgresql":
+        return f"COALESCE(CAST(NULLIF(REGEXP_REPLACE(CAST({col_expr} AS TEXT), '[$,₹€£¥%\\s]', '', 'g'), '') AS NUMERIC), 0)"
+    else:
+        cleaned = f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(CAST({col_expr} AS TEXT), '$', ''), '₹', ''), '€', ''), '£', ''), ',', ''), ' ', '')"
+        return f"COALESCE(CAST(NULLIF(TRIM({cleaned}), '') AS REAL), 0)"
+

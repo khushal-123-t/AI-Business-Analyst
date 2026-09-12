@@ -26,6 +26,7 @@ export interface AskResponse {
 
 export interface DashboardMetrics {
   total_revenue: number;
+  revenue?: number;
   total_profit: number | null;
   profit_available?: boolean;
   profit_source?: string | null;
@@ -35,6 +36,7 @@ export interface DashboardMetrics {
   average_order_value: number;
   metric_labels?: {
     primary_metric_title?: string;
+    revenue_title?: string;
     count_title?: string;
     average_title?: string;
     category_title?: string;
@@ -54,6 +56,7 @@ export interface DashboardResponse {
   skipped_visualizations?: string[];
   metric_labels?: {
     primary_metric_title?: string;
+    revenue_title?: string;
     count_title?: string;
     average_title?: string;
     category_title?: string;
